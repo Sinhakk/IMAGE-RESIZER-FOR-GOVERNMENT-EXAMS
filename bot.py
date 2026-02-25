@@ -360,6 +360,7 @@ class States(Enum):
 
 # ========================== START AND ACTION ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Welcome message with action selection."""
     if context.user_data.get("processing"):
         await update.message.reply_text(_("processing", context) + " " + _("cancel", context))
         return ConversationHandler.END
@@ -474,14 +475,12 @@ async def bg_preview_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton("PDF", callback_data="PDF")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        # Edit the caption of the photo message to ask for format
         await query.edit_message_caption(
             caption=_("format_choose", context),
             reply_markup=reply_markup
         )
         return States.BG_WAIT_FORMAT
     else:  # bg_restart
-        # Delete the preview photo and send a new text message
         await query.message.delete()
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -758,18 +757,15 @@ async def custom_preview_confirm(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await query.message.reply_text(_("error", context))
     else:  # custom_restart
-        # Delete preview and send new text message
         await query.message.delete()
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=_("resize", context) + " " + _("send_photo", context)
         )
-        # Clean partial data
         for key in ["custom_original_img", "custom_target_w", "custom_target_h", "custom_target_kb", "custom_final"]:
             context.user_data.pop(key, None)
         return States.CUSTOM_WAIT_PHOTO
 
-    # Clean up
     for key in ["custom_original_bytes", "custom_original_img", "custom_target_w", "custom_target_h", "custom_target_kb", "custom_final", "custom_final_caption", "custom_final_filename"]:
         context.user_data.pop(key, None)
     release_lock(context)
@@ -1085,7 +1081,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(_("start", context) + " /start")
+    """Send the main menu with buttons when the bot is not in a conversation."""
+    keyboard = [
+        [InlineKeyboardButton(_("bg_change", context), callback_data="bg_change")],
+        [InlineKeyboardButton(_("resize", context), callback_data="resize")],
+        [InlineKeyboardButton(_("signature", context), callback_data="signature")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        _("start", context),
+        reply_markup=reply_markup,
+    )
 
 # ========================== MAIN ==========================
 def main():
