@@ -21,7 +21,6 @@ from telegram.ext import (
 from flask import Flask
 import threading
 
-# Create a minimal Flask app
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -43,20 +42,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========================== CONSTANTS ==========================
-DPI = 300  # default dots per inch
+DPI = 300
 MAX_QUALITY = 95
 MIN_QUALITY = 10
-TARGET_SIZE_TOLERANCE = 0.99  # Aim for size <= target but at least 99% of target
-ASPECT_RATIO_TOLERANCE = 0.1  # 10% difference triggers warning
-PREVIEW_MAX_SIZE = (300, 300)  # Preview image max dimensions
-BLUR_THRESHOLD = 100  # Laplacian variance threshold for blur warning
-SIGNATURE_WHITE_THRESHOLD = 0.95  # 95% of pixels must be near white
+TARGET_SIZE_TOLERANCE = 0.99
+ASPECT_RATIO_TOLERANCE = 0.1
+PREVIEW_MAX_SIZE = (300, 300)
+BLUR_THRESHOLD = 100
+SIGNATURE_WHITE_THRESHOLD = 0.95
 
-# Load Haar cascade for face detection
 FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
 # ========================== LANGUAGE SUPPORT ==========================
-# Simple translation dict for Hinglish hints
 LANG_HINGLISH = {
     "start": "Namaste! Kya karna chahenge?",
     "bg_change": "Background badalna hai? Photo bhejo.",
@@ -100,31 +97,25 @@ LANG_EN = {
 }
 
 def _(key, context):
-    """Return localized string based on user preference."""
     if context.user_data.get("hinglish", False):
         return LANG_HINGLISH.get(key, LANG_EN.get(key, key))
     return LANG_EN.get(key, key)
 
 # ========================== HELPER FUNCTIONS ==========================
 def fix_orientation(image: Image.Image) -> Image.Image:
-    """Apply EXIF orientation to correct rotation/flip."""
     return ImageOps.exif_transpose(image)
 
 def ensure_srgb(image: Image.Image) -> Image.Image:
-    """Convert image to sRGB (RGB or RGBA) and strip ICC profile."""
     if image.mode not in ("RGB", "RGBA"):
         image = image.convert("RGBA" if image.mode == "P" and image.info.get("transparency") else "RGB")
-    # Strip ICC profile to avoid color shifts
     image.info.pop("icc_profile", None)
     return image
 
 def set_dpi(image: Image.Image, dpi=DPI):
-    """Set DPI metadata for the image."""
     image.info["dpi"] = (dpi, dpi)
     return image
 
 def parse_dimensions(text: str):
-    """Parse user input like '300x200 px', '5x4 cm', etc."""
     pattern = r"(\d+(?:\.\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(px|cm|mm|inch|in)?"
     match = re.search(pattern, text)
     if not match:
@@ -135,7 +126,6 @@ def parse_dimensions(text: str):
     return w, h, unit.lower()
 
 def dimensions_to_pixels(width, height, unit):
-    """Convert dimensions to pixels using DPI."""
     if unit == "px":
         return int(width), int(height)
     elif unit in ("cm", "mm", "inch", "in"):
@@ -145,7 +135,7 @@ def dimensions_to_pixels(width, height, unit):
         elif unit == "mm":
             inches_w = width / 25.4
             inches_h = height / 25.4
-        else:  # inch/in
+        else:
             inches_w = width
             inches_h = height
         return int(inches_w * DPI), int(inches_h * DPI)
@@ -153,31 +143,20 @@ def dimensions_to_pixels(width, height, unit):
         raise ValueError(f"Unknown unit: {unit}")
 
 def resize_to_exact(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Resize image to exact dimensions (may distort)."""
     return image.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
 def compress_to_target_size(image: Image.Image, target_kb: int, format: str = "JPEG", strict: bool = False) -> io.BytesIO:
-    """
-    Strictly compress image to fit within target_kb.
-    If strict=True, tolerance is ±1 KB, otherwise ±5%.
-    For JPEG: binary search on quality.
-    For PNG: warn if size exceeds (handled later).
-    For PDF: save as PDF (size may exceed).
-    Returns BytesIO with final image.
-    """
     target_bytes = target_kb * 1024
-    tolerance = 0.01 if strict else 0.05  # ±1% or ±5%
+    tolerance = 0.01 if strict else 0.05
     output = io.BytesIO()
 
     if format.upper() == "JPEG":
-        # Binary search on quality
         low, high = MIN_QUALITY, MAX_QUALITY
         best_quality = high
         best_data = None
         while low <= high:
             mid = (low + high) // 2
             img_byte_arr = io.BytesIO()
-            # Ensure RGB for JPEG
             if image.mode in ("RGBA", "P", "LA"):
                 image = image.convert("RGB")
             image.save(img_byte_arr, format='JPEG', quality=mid, optimize=True, dpi=(DPI, DPI))
@@ -189,19 +168,15 @@ def compress_to_target_size(image: Image.Image, target_kb: int, format: str = "J
             else:
                 high = mid - 1
         if best_data is None:
-            # Even lowest quality exceeds target – use lowest and warn (will be caught later)
             img_byte_arr = io.BytesIO()
             image.save(img_byte_arr, format='JPEG', quality=MIN_QUALITY, optimize=True, dpi=(DPI, DPI))
             best_data = img_byte_arr.getvalue()
         output = io.BytesIO(best_data)
     elif format.upper() == "PNG":
-        # PNG compression is lossless; we can't control size tightly.
-        # Set DPI in PNG info
         pnginfo = Image.PngImageInfo()
         pnginfo.dpi = (DPI, DPI)
         image.save(output, format='PNG', optimize=True, pnginfo=pnginfo)
     elif format.upper() == "PDF":
-        # Save as PDF (single page) with DPI
         if image.mode == "RGBA":
             image = image.convert("RGB")
         image.save(output, format='PDF', resolution=DPI)
@@ -211,97 +186,63 @@ def compress_to_target_size(image: Image.Image, target_kb: int, format: str = "J
     return output
 
 def detect_face_center(image: Image.Image):
-    """
-    Detect face using OpenCV Haar cascade.
-    Returns (x_center, y_center, face_width, face_height) or None if no face.
-    """
-    # Convert PIL to OpenCV BGR
     open_cv_image = np.array(image.convert('RGB'))
     open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
     faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     if len(faces) == 0:
         return None
-    # Take the largest face
     (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
     center_x = x + w // 2
     center_y = y + h // 2
     return center_x, center_y, w, h
 
 def center_face_in_dimensions(image: Image.Image, target_w: int, target_h: int):
-    """
-    Crop and resize image so that the face is centered in the target dimensions.
-    If no face detected, returns a simple centered crop.
-    """
     orig_w, orig_h = image.size
     face_data = detect_face_center(image)
     if face_data is None:
-        # No face: just center crop to target aspect ratio
         target_ratio = target_w / target_h
         orig_ratio = orig_w / orig_h
         if orig_ratio > target_ratio:
-            # Original is wider: crop width
             new_w = int(orig_h * target_ratio)
             left = (orig_w - new_w) // 2
             image = image.crop((left, 0, left + new_w, orig_h))
         else:
-            # Original is taller: crop height
             new_h = int(orig_w / target_ratio)
             top = (orig_h - new_h) // 2
             image = image.crop((0, top, orig_w, top + new_h))
         return image.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
-    # Face detected: we want the face to be at a certain position (e.g., 45% from top)
     cx, cy, fw, fh = face_data
-    # Desired face center Y as fraction of target height (commonly 0.45 for passport photos)
     target_face_y = int(target_h * 0.45)
-    # Desired face size relative to target height (e.g., 60% of target height)
     target_face_height = int(target_h * 0.6)
-    # Scale factor to achieve target face height
     scale = target_face_height / fh
-    # New image dimensions after scaling
     new_w = int(orig_w * scale)
     new_h = int(orig_h * scale)
-    # Resize image
     resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    # New face center coordinates after scaling
     new_cx = int(cx * scale)
     new_cy = int(cy * scale)
-    # Crop to target dimensions around desired face center
     left = new_cx - target_w // 2
-    top = new_cy - target_face_y  # we want face Y at target_face_y
-    # Ensure crop stays within image bounds
+    top = new_cy - target_face_y
     left = max(0, min(left, new_w - target_w))
     top = max(0, min(top, new_h - target_h))
     cropped = resized.crop((left, top, left + target_w, top + target_h))
     return cropped
 
 def simple_background_replace(image: Image.Image, new_color):
-    """
-    Replace background (assumed to be light/white) with new_color.
-    Uses color distance in HSV space to create a mask, then smooths edges.
-    Preserves edges and hair details.
-    """
-    # Convert to RGB if necessary
     if image.mode != "RGB":
         image = image.convert("RGB")
-    # Convert to numpy array
     img_array = np.array(image)
-    # Convert to HSV
     hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
-    # Define range for "background" – low saturation and high value (white/light)
     lower = np.array([0, 0, 200])
     upper = np.array([180, 30, 255])
     mask = cv2.inRange(hsv, lower, upper)
-    # Morphological operations to clean mask
     kernel = np.ones((5,5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    # Feather edges
     mask = cv2.GaussianBlur(mask, (5,5), 0)
-    mask = mask / 255.0  # float mask
+    mask = mask / 255.0
 
-    # Prepare new background
     if isinstance(new_color, str):
         try:
             new_color_rgb = ImageColor.getrgb(new_color)
@@ -311,42 +252,28 @@ def simple_background_replace(image: Image.Image, new_color):
         new_color_rgb = new_color
     new_bg = np.full_like(img_array, new_color_rgb)
 
-    # Blend using mask
     mask_3ch = np.stack([mask, mask, mask], axis=2)
     result = (img_array * (1 - mask_3ch) + new_bg * mask_3ch).astype(np.uint8)
     return Image.fromarray(result)
 
 def process_signature(image: Image.Image, target_height: int, target_kb: int, strict: bool = False) -> io.BytesIO:
-    """
-    Convert signature to pure black on white, resize to target height (maintaining aspect),
-    then compress to target KB (JPEG).
-    """
-    # Convert to grayscale
     if image.mode != "L":
         image = image.convert("L")
-    # Enhance contrast
     image = ImageOps.autocontrast(image, cutoff=2)
-    # Binarize: threshold to pure black/white
     threshold = 128
     image = image.point(lambda p: 255 if p > threshold else 0)
-    # Convert back to RGB (for JPEG)
     image = image.convert("RGB")
-    # Resize based on height
     w, h = image.size
     new_w = int(w * target_height / h)
     image = image.resize((new_w, target_height), Image.Resampling.LANCZOS)
-    # Compress to target KB
     return compress_to_target_size(image, target_kb, "JPEG", strict)
 
 def format_file_size(size_bytes):
-    """Convert bytes to KB string."""
     return f"{size_bytes/1024:.1f} KB"
 
 def create_preview(image: Image.Image) -> io.BytesIO:
-    """Create a low-res JPEG preview."""
     image.thumbnail(PREVIEW_MAX_SIZE, Image.Resampling.LANCZOS)
     preview = io.BytesIO()
-    # Ensure RGB for JPEG
     if image.mode != "RGB":
         image = image.convert("RGB")
     image.save(preview, format="JPEG", quality=70)
@@ -354,37 +281,27 @@ def create_preview(image: Image.Image) -> io.BytesIO:
     return preview
 
 def check_aspect_ratio(orig_w, orig_h, target_w, target_h):
-    """Return True if aspect ratios are within tolerance."""
     orig_ratio = orig_w / orig_h
     target_ratio = target_w / target_h
     diff = abs(orig_ratio - target_ratio) / target_ratio
     return diff <= ASPECT_RATIO_TOLERANCE
 
 def detect_blur(image: Image.Image) -> float:
-    """Return Laplacian variance (lower means blurrier)."""
-    # Convert to grayscale numpy array
     gray = np.array(image.convert("L"))
-    # Compute Laplacian variance
     laplacian = cv2.Laplacian(gray, cv2.CV_64F)
     return laplacian.var()
 
 def auto_level(image: Image.Image) -> Image.Image:
-    """Apply subtle auto-contrast to fix exposure."""
-    # Use autocontrast with a small cutoff to avoid over-processing
     return ImageOps.autocontrast(image, cutoff=1)
 
 def check_signature_bg(image: Image.Image) -> bool:
-    """Return True if background is sufficiently white."""
-    # Convert to numpy, check near-white pixels
     img_array = np.array(image.convert("RGB"))
-    # Define near-white: all channels > 240
     white_mask = np.all(img_array > 240, axis=2)
     white_ratio = np.sum(white_mask) / white_mask.size
     return white_ratio >= SIGNATURE_WHITE_THRESHOLD
 
 # ========================== JOB LOCK ==========================
 async def with_lock(update: Update, context: ContextTypes.DEFAULT_TYPE, next_state):
-    """Check if user is already processing; if not, set lock and proceed."""
     if context.user_data.get("processing"):
         await update.message.reply_text(_("processing", context) + " " + _("cancel", context))
         return ConversationHandler.END
@@ -392,28 +309,22 @@ async def with_lock(update: Update, context: ContextTypes.DEFAULT_TYPE, next_sta
     return next_state
 
 def release_lock(context: ContextTypes.DEFAULT_TYPE):
-    """Release the processing lock."""
     context.user_data.pop("processing", None)
 
 # ========================== COMMAND HANDLERS (SETTINGS) ==========================
 async def strict_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle strict mode for file size."""
-    user_id = update.effective_user.id
     current = context.user_data.get("strict", False)
     context.user_data["strict"] = not current
     status = "ON" if not current else "OFF"
     await update.message.reply_text(f"Strict mode {status}. File size tolerance now ±1 KB when ON.")
 
 async def hinglish_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle Hinglish hints."""
-    user_id = update.effective_user.id
     current = context.user_data.get("hinglish", False)
     context.user_data["hinglish"] = not current
     status = "Hinglish" if not current else "English"
     await update.message.reply_text(f"Language set to {status}.")
 
 async def set_dpi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set DPI (72 or 300)."""
     args = context.args
     if args and args[0] in ("72", "300"):
         context.user_data["dpi"] = int(args[0])
@@ -427,29 +338,28 @@ class States(Enum):
     BG_WAIT_PHOTO = 1
     BG_WAIT_COLOR = 2
     BG_PREVIEW = 3
-    BG_WAIT_FORMAT = 19           # <-- Added missing state
+    BG_WAIT_FORMAT = 19
     RESIZE_MODE = 4
     CUSTOM_WAIT_PHOTO = 5
     CUSTOM_WAIT_DIMENSIONS = 6
     CUSTOM_WAIT_SIZE_OPTION = 7
     CUSTOM_WAIT_TARGET_SIZE = 8
-    CUSTOM_WAIT_FORMAT = 20        # <-- Added missing state
+    CUSTOM_WAIT_FORMAT = 20
     CUSTOM_PREVIEW = 9
     REDUCE_WAIT_PHOTO = 10
     REDUCE_WAIT_TARGET_SIZE = 11
-    REDUCE_WAIT_FORMAT = 21         # <-- Added missing state
+    REDUCE_WAIT_FORMAT = 21
     REDUCE_PREVIEW = 12
     SIGNATURE_WAIT_PHOTO = 13
     SIGNATURE_WAIT_HEIGHT = 14
     SIGNATURE_WAIT_SIZE = 15
-    SIGNATURE_WAIT_FORMAT = 22      # <-- Added missing state
+    SIGNATURE_WAIT_FORMAT = 22
     SIGNATURE_PREVIEW = 16
     CONFIRM_OVERSIZE = 17
     CONFIRM_ASPECT = 18
 
 # ========================== START AND ACTION ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Welcome message with action selection."""
     if context.user_data.get("processing"):
         await update.message.reply_text(_("processing", context) + " " + _("cancel", context))
         return ConversationHandler.END
@@ -510,13 +420,11 @@ async def bg_wait_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     image_bytes.seek(0)
     context.user_data["bg_original"] = image_bytes
 
-    # Load, fix orientation, ensure sRGB
     img = Image.open(image_bytes)
     img = fix_orientation(img)
     img = ensure_srgb(img).convert("RGB")
     context.user_data["bg_img"] = img
 
-    # Blur check
     blur_var = detect_blur(img)
     if blur_var < BLUR_THRESHOLD:
         await update.message.reply_text(_("blur_warn", context))
@@ -542,7 +450,6 @@ async def bg_wait_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         release_lock(context)
         return ConversationHandler.END
 
-    # Create and send preview
     preview = create_preview(result_img.copy())
     keyboard = [
         [InlineKeyboardButton(_("looks_ok", context), callback_data="bg_confirm")],
@@ -567,10 +474,19 @@ async def bg_preview_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton("PDF", callback_data="PDF")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(_("format_choose", context), reply_markup=reply_markup)
+        # Edit the caption of the photo message to ask for format
+        await query.edit_message_caption(
+            caption=_("format_choose", context),
+            reply_markup=reply_markup
+        )
         return States.BG_WAIT_FORMAT
     else:  # bg_restart
-        await query.edit_message_text(_("bg_change", context) + " " + _("send_photo", context))
+        # Delete the preview photo and send a new text message
+        await query.message.delete()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=_("bg_change", context) + " " + _("send_photo", context)
+        )
         context.user_data.pop("bg_img", None)
         context.user_data.pop("bg_result", None)
         return States.BG_WAIT_PHOTO
@@ -637,12 +553,10 @@ async def custom_wait_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     img = ensure_srgb(img)
     context.user_data["custom_original_img"] = img
 
-    # Blur check
     blur_var = detect_blur(img)
     if blur_var < BLUR_THRESHOLD:
         await update.message.reply_text(_("blur_warn", context))
 
-    # Auto-level if needed (subtle)
     img = auto_level(img)
     context.user_data["custom_original_img"] = img
 
@@ -660,7 +574,6 @@ async def custom_wait_dimensions(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"{_('error', context)}: {e}\n{_('dimensions', context)}")
         return States.CUSTOM_WAIT_DIMENSIONS
 
-    # Check aspect ratio
     img = context.user_data.get("custom_original_img")
     if img:
         orig_w, orig_h = img.size
@@ -844,8 +757,13 @@ async def custom_preview_confirm(update: Update, context: ContextTypes.DEFAULT_T
             )
         else:
             await query.message.reply_text(_("error", context))
-    else:
-        await query.edit_message_text(_("resize", context) + " " + _("send_photo", context))
+    else:  # custom_restart
+        # Delete preview and send new text message
+        await query.message.delete()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=_("resize", context) + " " + _("send_photo", context)
+        )
         # Clean partial data
         for key in ["custom_original_img", "custom_target_w", "custom_target_h", "custom_target_kb", "custom_final"]:
             context.user_data.pop(key, None)
@@ -870,7 +788,6 @@ async def reduce_wait_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     img = ensure_srgb(img)
     context.user_data["reduce_original_img"] = img
 
-    # Blur check
     blur_var = detect_blur(img)
     if blur_var < BLUR_THRESHOLD:
         await update.message.reply_text(_("blur_warn", context))
@@ -978,8 +895,12 @@ async def reduce_preview_confirm(update: Update, context: ContextTypes.DEFAULT_T
             )
         else:
             await query.message.reply_text(_("error", context))
-    else:
-        await query.edit_message_text(_("send_photo", context))
+    else:  # reduce_restart
+        await query.message.delete()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=_("send_photo", context)
+        )
         for key in ["reduce_original_img", "reduce_target_kb", "reduce_final"]:
             context.user_data.pop(key, None)
         return States.REDUCE_WAIT_PHOTO
@@ -1002,7 +923,6 @@ async def signature_wait_photo(update: Update, context: ContextTypes.DEFAULT_TYP
     img = ensure_srgb(img)
     context.user_data["sig_original_img"] = img
 
-    # Check background purity
     if not check_signature_bg(img):
         await update.message.reply_text(_("signature_bg_warn", context))
 
@@ -1116,8 +1036,12 @@ async def signature_preview_confirm(update: Update, context: ContextTypes.DEFAUL
             )
         else:
             await query.message.reply_text(_("error", context))
-    else:
-        await query.edit_message_text(_("signature", context) + " " + _("send_photo", context))
+    else:  # sig_restart
+        await query.message.delete()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=_("signature", context) + " " + _("send_photo", context)
+        )
         for key in ["sig_original_img", "sig_height", "sig_target_kb", "sig_final"]:
             context.user_data.pop(key, None)
         return States.SIGNATURE_WAIT_PHOTO
@@ -1169,19 +1093,15 @@ def main():
     if not token:
         raise ValueError("No BOT_TOKEN environment variable set")
 
-    # ===== START FLASK IN BACKGROUND =====
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    # =====================================
 
     application = Application.builder().token(token).build()
 
-    # Add command handlers for settings
     application.add_handler(CommandHandler("strict", strict_mode))
     application.add_handler(CommandHandler("hinglish", hinglish_mode))
     application.add_handler(CommandHandler("dpi", set_dpi_command))
 
-    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
