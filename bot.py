@@ -17,6 +17,21 @@ from telegram.ext import (
     filters,
 )
 
+# ========== FLASK ADDITION ==========
+from flask import Flask
+import threading
+
+# Create a minimal Flask app
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "Telegram bot is running."
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
+
 # ========================== VERSION ==========================
 VERSION = "v2.1"
 
