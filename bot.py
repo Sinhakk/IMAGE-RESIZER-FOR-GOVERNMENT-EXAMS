@@ -31,6 +31,7 @@ def home():
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port)
+# ====================================
 
 # ========================== VERSION ==========================
 VERSION = "v2.1"
@@ -1163,6 +1164,11 @@ def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise ValueError("No BOT_TOKEN environment variable set")
+
+    # ===== START FLASK IN BACKGROUND =====
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    # =====================================
 
     application = Application.builder().token(token).build()
 
