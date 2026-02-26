@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: image-utility-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false        # Set manually in Render dashboard
+      - key: PORT
+        value: 8080
+    healthCheckPath: /health
