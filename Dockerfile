@@ -1,35 +1,62 @@
-# ---- Base image ----
-FROM python:3.10-slim
+# ─────────────────────────────────────────────
+# Base Image (Lightweight)
+# ─────────────────────────────────────────────
+FROM python:3.11-slim
 
-# ---- Environment ----
-ENV PYTHONDONTWRITEBYTECODE=1
+# ─────────────────────────────────────────────
+# Prevent Python from buffering stdout/stderr
+# ─────────────────────────────────────────────
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-# ---- System dependencies (OpenCV + MediaPipe + Pillow) ----
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
+# ─────────────────────────────────────────────
+# Install system dependencies required by:
+# - opencv
+# - mediapipe
+# - pillow
+# ─────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    build-essential \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender1 \
-    ffmpeg \
-    ca-certificates \
+    libxrender-dev \
+    libgl1 \
+    libgtk-3-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- Working directory ----
+# ─────────────────────────────────────────────
+# Create non-root user (security)
+# ─────────────────────────────────────────────
+RUN useradd -m botuser
 WORKDIR /app
 
-# ---- Copy requirements first (better layer caching) ----
+# ─────────────────────────────────────────────
+# Copy requirements first (better caching)
+# ─────────────────────────────────────────────
 COPY requirements.txt .
 
-# ---- Install Python dependencies ----
-RUN pip install --no-cache-dir -r requirements.txt
+# Upgrade pip + install deps
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-# ---- Copy bot source ----
+# ─────────────────────────────────────────────
+# Copy project files
+# ─────────────────────────────────────────────
 COPY . .
 
-# ---- Expose port for Render health check ----
+# Change ownership
+RUN chown -R botuser:botuser /app
+USER botuser
+
+# ─────────────────────────────────────────────
+# Expose port for Flask health server
+# Render will provide PORT env variable
+# ─────────────────────────────────────────────
 EXPOSE 8080
 
-# ---- Start bot ----
+# ─────────────────────────────────────────────
+# Start bot
+# ─────────────────────────────────────────────
 CMD ["python", "bot.py"]
