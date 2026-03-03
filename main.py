@@ -1233,6 +1233,111 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+# ─────────────────────────────────────────────────────────────────────
+# ADMIN: PRESET MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────
+
+async def cmd_listpresets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await safe_reply(update, "❌ Access denied.")
+        return
+    presets = db_list_all_presets()
+    if not presets:
+        await safe_reply(update, "📋 No presets yet.")
+        return
+    lines = ["📋 *All Presets (Admin View)*\n"]
+    for p in presets:
+        status = "✅" if p["active"] else "❌ deleted"
+        lines.append(f"{status} `ID:{p['id']}` — {p['label']} — `{p['width_px']}×{p['height_px']}px`")
+    lines.append("\n`/addpreset Label | w | h`")
+    lines.append("`/editpreset ID | Label | w | h`")
+    lines.append("`/delpreset ID`")
+    await safe_reply(update, "\n".join(lines))
+
+
+async def cmd_addpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await safe_reply(update, "❌ Access denied.")
+        return
+    raw   = " ".join(ctx.args) if ctx.args else ""
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) != 3:
+        await safe_reply(update,
+            "📝 *Format:* `/addpreset Label | width | height`\n\n"
+            "*Example:* `/addpreset Railway 2025 | 413 | 531`")
+        return
+    label = parts[0].strip()
+    try:
+        w, h = int(parts[1].strip()), int(parts[2].strip())
+        if not (0 < w <= 5000 and 0 < h <= 5000):
+            raise ValueError
+    except ValueError:
+        await safe_reply(update, "❌ Width/height must be valid numbers (1–5000 px).")
+        return
+    if not label:
+        await safe_reply(update, "❌ Label khali nahi hona chahiye.")
+        return
+    new_id = db_add_preset(label, w, h)
+    await safe_reply(update,
+        f"✅ *Preset added!*\n🆔 ID:`{new_id}` — {label} — `{w}×{h}px`\n\n"
+        f"_Live immediately — no restart needed._")
+
+
+async def cmd_editpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await safe_reply(update, "❌ Access denied.")
+        return
+    raw   = " ".join(ctx.args) if ctx.args else ""
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) != 4:
+        await safe_reply(update,
+            "📝 *Format:* `/editpreset ID | Label | width | height`\n\n"
+            "*Example:* `/editpreset 9 | Railway 2026 | 450 | 550`")
+        return
+    try:
+        pid   = int(parts[0].strip())
+        label = parts[1].strip()
+        w, h  = int(parts[2].strip()), int(parts[3].strip())
+        if not (0 < w <= 5000 and 0 < h <= 5000):
+            raise ValueError
+    except ValueError:
+        await safe_reply(update, "❌ ID aur dimensions valid numbers hone chahiye.")
+        return
+    preset = db_get_preset_by_id(pid)
+    if not preset:
+        await safe_reply(update, f"❌ ID `{pid}` not found.")
+        return
+    db_edit_preset(pid, label, w, h)
+    await safe_reply(update,
+        f"✅ *Preset updated!*\n"
+        f"Before: {preset['label']} `{preset['width_px']}×{preset['height_px']}`\n"
+        f"After: {label} `{w}×{h}px`\n\n_Live immediately._")
+
+
+async def cmd_delpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await safe_reply(update, "❌ Access denied.")
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await safe_reply(update,
+            "📝 *Format:* `/delpreset ID`\n\n"
+            "*Example:* `/delpreset 3`")
+        return
+    pid    = int(ctx.args[0])
+    preset = db_get_preset_by_id(pid)
+    if not preset:
+        await safe_reply(update, f"❌ ID `{pid}` not found.")
+        return
+    db_delete_preset(pid)
+    await safe_reply(update,
+        f"🗑 *Deleted:* {preset['label']} `{preset['width_px']}×{preset['height_px']}px`")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # GRACEFUL SHUTDOWN
 # ─────────────────────────────────────────────────────────────────────
