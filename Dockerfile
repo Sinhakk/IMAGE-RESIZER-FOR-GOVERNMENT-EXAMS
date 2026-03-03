@@ -1,62 +1,46 @@
-# ─────────────────────────────────────────────
-# Base Image (Lightweight)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# IMAGE UTILITY BOT — Dockerfile
+# Base: python:3.11-slim (mediapipe needs 3.11 max, not 3.12)
+# ─────────────────────────────────────────────────────────────────────
+
 FROM python:3.11-slim
 
-# ─────────────────────────────────────────────
-# Prevent Python from buffering stdout/stderr
-# ─────────────────────────────────────────────
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-
-# ─────────────────────────────────────────────
-# Install system dependencies required by:
-# - opencv
-# - mediapipe
-# - pillow
-# ─────────────────────────────────────────────
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgl1 \
-    libgtk-3-0 \
-    curl \
+# System deps:
+#  libgl1 + libglib2.0-0  → OpenCV (headless still needs these)
+#  libgomp1               → mediapipe (OpenMP)
+#  libsm6 + libxext6      → some PIL/cv2 edge cases
+#  wget + ca-certificates → mediapipe model download at runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        wget \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# ─────────────────────────────────────────────
-# Create non-root user (security)
-# ─────────────────────────────────────────────
-RUN useradd -m botuser
+# Non-root user — never run bots as root
+RUN useradd -m -u 1000 botuser
+
 WORKDIR /app
 
-# ─────────────────────────────────────────────
-# Copy requirements first (better caching)
-# ─────────────────────────────────────────────
+# Install Python deps first (layer cache — rebuild only if requirements change)
 COPY requirements.txt .
-
-# Upgrade pip + install deps
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# ─────────────────────────────────────────────
-# Copy project files
-# ─────────────────────────────────────────────
-COPY . .
+# Copy bot code
+COPY main.py .
 
-# Change ownership
-RUN chown -R botuser:botuser /app
+# DB lives in /tmp (Render ephemeral disk) — writable by botuser
+RUN mkdir -p /tmp && chown botuser:botuser /tmp
+
 USER botuser
 
-# ─────────────────────────────────────────────
-# Expose port for Flask health server
-# Render will provide PORT env variable
-# ─────────────────────────────────────────────
+# Port for Flask health check (Render uses this)
 EXPOSE 8080
 
-# ─────────────────────────────────────────────
-# Start bot
-# ─────────────────────────────────────────────
-CMD ["python", "bot.py"]
+# Entrypoint
+CMD ["python", "main.py"]
