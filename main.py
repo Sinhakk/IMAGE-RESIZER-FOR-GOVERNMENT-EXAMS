@@ -1230,3 +1230,141 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         conn.execute("INSERT INTO broadcasts(message, sent_at) VALUES(?,?)",
                      (message, datetime.utcnow().isoformat()))
     await status.edit_text(f"✅ Done! Sent: `{sent}` | Failed: `{failed}`")
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# GRACEFUL SHUTDOWN
+# ─────────────────────────────────────────────────────────────────────
+def handle_signal(sig, frame):
+    global _bot_healthy
+    _bot_healthy = False
+    _wipe_session_key()
+    logger.info(f"Signal {sig} — session key wiped, shutting down.")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT,  handle_signal)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# POST INIT — register commands, warm up model
+# ─────────────────────────────────────────────────────────────────────
+async def post_init(application: Application):
+    public_commands = [
+        BotCommand("start",    "Main menu"),
+        BotCommand("help",     "How to use"),
+        BotCommand("privacy",  "Privacy policy"),
+        BotCommand("cancel",   "Cancel current operation"),
+        BotCommand("mystats",  "Your usage stats"),
+        BotCommand("hinglish", "Toggle Hinglish/English"),
+        BotCommand("strict",   "Toggle strict aspect ratio"),
+        BotCommand("dpi",      "Set output DPI (72/150/300)"),
+    ]
+    admin_commands = public_commands + [
+        BotCommand("admin",       "Admin panel"),
+        BotCommand("broadcast",   "Broadcast to all users"),
+        BotCommand("listpresets", "List all presets"),
+        BotCommand("addpreset",   "Add new preset"),
+        BotCommand("editpreset",  "Edit existing preset"),
+        BotCommand("delpreset",   "Delete a preset"),
+    ]
+    await application.bot.set_my_commands(public_commands)
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.set_my_commands(
+                admin_commands,
+                scope={"type": "chat", "chat_id": admin_id}
+            )
+        except Exception:
+            pass
+    logger.info("Bot commands registered.")
+    warm_up_model()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────
+def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        logger.error("BOT_TOKEN environment variable not set!")
+        sys.exit(1)
+
+    if _UID_SALT == "change-this-salt-in-production":
+        logger.warning("⚠️  UID_SALT env var not set! Set a random secret in Render env vars.")
+
+    init_db()
+    logger.info(f"Database ready: {DB_PATH}")
+
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info(f"Flask health server starting on port {os.environ.get('PORT', 8080)}")
+
+    application = Application.builder().token(token).post_init(post_init).build()
+
+    # Standalone commands
+    for cmd, fn in [
+        ("help",        cmd_help),
+        ("privacy",     cmd_privacy),
+        ("hinglish",    cmd_hinglish),
+        ("strict",      cmd_strict),
+        ("dpi",         cmd_dpi),
+        ("mystats",     cmd_mystats),
+        ("admin",       cmd_admin),
+        ("broadcast",   cmd_broadcast),
+        ("listpresets", cmd_listpresets),
+        ("addpreset",   cmd_addpreset),
+        ("editpreset",  cmd_editpreset),
+        ("delpreset",   cmd_delpreset),
+    ]:
+        application.add_handler(CommandHandler(cmd, fn))
+
+    # Main conversation
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            S.SELECT_ACTION:        [CallbackQueryHandler(select_action)],
+            S.BG_WAIT_PHOTO:        [MessageHandler(filters.PHOTO | filters.Document.IMAGE, bg_wait_photo)],
+            S.BG_WAIT_COLOR:        [
+                CallbackQueryHandler(bg_wait_color, pattern=r"^col_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bg_wait_color),
+            ],
+            S.BG_PREVIEW:           [CallbackQueryHandler(bg_preview,          pattern=r"^bg_")],
+            S.BG_WAIT_FORMAT:       [CallbackQueryHandler(bg_wait_format,       pattern=r"^fmt_")],
+            S.RESIZE_MODE:          [CallbackQueryHandler(resize_mode,          pattern=r"^resize_")],
+            S.CUSTOM_WAIT_PHOTO:    [MessageHandler(filters.PHOTO | filters.Document.IMAGE, custom_wait_photo)],
+            S.CUSTOM_SELECT_PRESET: [CallbackQueryHandler(custom_select_preset, pattern=r"^preset_")],
+            S.CUSTOM_WAIT_DIMS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_wait_dims)],
+            S.CUSTOM_PREVIEW:       [CallbackQueryHandler(custom_preview,       pattern=r"^resize_")],
+            S.CUSTOM_SIZE_OPT:      [CallbackQueryHandler(custom_size_opt,      pattern=r"^sizeopt_")],
+            S.CUSTOM_WAIT_KB:       [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_wait_kb)],
+            S.CUSTOM_WAIT_FORMAT:   [CallbackQueryHandler(custom_wait_format,   pattern=r"^fmt_")],
+            S.REDUCE_WAIT_PHOTO:    [MessageHandler(filters.PHOTO | filters.Document.IMAGE, reduce_wait_photo)],
+            S.REDUCE_WAIT_KB:       [MessageHandler(filters.TEXT & ~filters.COMMAND, reduce_wait_kb)],
+            S.REDUCE_WAIT_FORMAT:   [CallbackQueryHandler(reduce_wait_format,   pattern=r"^fmt_")],
+            S.SIG_WAIT_PHOTO:       [MessageHandler(filters.PHOTO | filters.Document.IMAGE, sig_wait_photo)],
+            S.SIG_PREVIEW:          [CallbackQueryHandler(sig_preview,          pattern=r"^sig_")],
+            S.SIG_WAIT_FORMAT:      [CallbackQueryHandler(sig_wait_format,      pattern=r"^fmt_")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler("start",  cmd_start),
+            MessageHandler(filters.ALL, conversation_fallback),
+        ],
+        allow_reentry=True,
+        conversation_timeout=1800,
+    )
+
+    application.add_handler(conv)
+    application.add_handler(MessageHandler(filters.ALL, global_fallback))
+    application.add_error_handler(error_handler)
+
+    logger.info(f"🚀 {VERSION} starting — privacy-first mode active")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
