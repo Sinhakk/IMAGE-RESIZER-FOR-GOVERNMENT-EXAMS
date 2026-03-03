@@ -3,10 +3,17 @@ services:
     name: image-utility-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python bot_production.py
     envVars:
       - key: BOT_TOKEN
-        sync: false        # Set manually in Render dashboard
+        sync: false        # Set this in Render dashboard
+      - key: ADMIN_IDS
+        sync: false        # Your Telegram user ID (comma-separated)
+      - key: DB_PATH
+        value: /tmp/imagebot.db
+      - key: UID_SALT
+        sync: false        # Random secret — set this in Render dashboard!
       - key: PORT
         value: 8080
     healthCheckPath: /health
+    autoDeploy: true
