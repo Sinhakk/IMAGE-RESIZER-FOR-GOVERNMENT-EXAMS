@@ -1097,27 +1097,25 @@ def size_option_kb(ctx) -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────────────────────────────
 # COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────
+# COMMAND HANDLERS
+# ─────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
-    _known_real_ids.add(uid)  # RAM-only, for broadcast
-    upsert_user(uid)           # stores only hashed_uid in DB
-
-    # Restore persistent preferences
+    _known_real_ids.add(uid)
+    upsert_user(uid)
     if "hinglish" not in ctx.user_data:
         ctx.user_data.update(get_user_prefs(uid))
-
-    # Wipe any stale image data, keep only preferences
     secure_wipe_all(ctx, _IMAGE_KEYS)
-    preserve = {k: ctx.user_data[k]
-                for k in ("hinglish", "strict", "dpi")
-                if k in ctx.user_data}
+    preserve = {k: ctx.user_data[k] for k in ("hinglish", "strict", "dpi") if k in ctx.user_data}
     release_lock(ctx)
     ctx.user_data.clear()
     ctx.user_data.update(preserve)
-
     log_state(uid, "START", "/start")
     await send_main_menu(update, ctx)
     return S.SELECT_ACTION
+
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, t("help_text", ctx))
@@ -1126,102 +1124,82 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_privacy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, t("privacy_notice", ctx))
 
+
 async def cmd_hinglish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     curr = ctx.user_data.get("hinglish", False)
     ctx.user_data["hinglish"] = not curr
     save_user_pref(update.effective_user.id, "hinglish", int(not curr))
-    key = "lang_hi" if not curr else "lang_en"
-    await safe_reply(update, t(key, ctx))
+    await safe_reply(update, t("lang_hi" if not curr else "lang_en", ctx))
+
 
 async def cmd_strict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     curr = ctx.user_data.get("strict", False)
     ctx.user_data["strict"] = not curr
     save_user_pref(update.effective_user.id, "strict", int(not curr))
-    key = "strict_on" if not curr else "strict_off"
-    await safe_reply(update, t(key, ctx))
+    await safe_reply(update, t("strict_on" if not curr else "strict_off", ctx))
+
 
 async def cmd_dpi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if args and args[0] in ("72", "96", "150", "300"):
-        v = int(args[0])
+    if ctx.args and ctx.args[0] in ("72", "96", "150", "300"):
+        v = int(ctx.args[0])
         ctx.user_data["dpi"] = v
         save_user_pref(update.effective_user.id, "dpi", v)
         await safe_reply(update, t("dpi_set", ctx) + f"`{v}`")
     else:
         await safe_reply(update, t("dpi_usage", ctx))
 
-# /history command intentionally removed.
-# Storing user images — even temporarily in RAM — violates privacy-first design.
-# Users can simply reprocess if needed.
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    secure_wipe_all(ctx, ["bg_img","bg_result","resize_img","resize_result",
-                  "reduce_img","sig_result","target_kb"])
+    secure_wipe_all(ctx, _IMAGE_KEYS)
     release_lock(ctx)
     await safe_reply(update, t("cancel", ctx))
     await send_main_menu(update, ctx)
     return ConversationHandler.END
 
+
 async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     hid = hash_uid(uid)
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT total_ops, dpi FROM users WHERE hashed_uid=?", (hid,)
-        ).fetchone()
+        row = conn.execute("SELECT total_ops, dpi FROM users WHERE hashed_uid=?", (hid,)).fetchone()
     if not row:
-        await safe_reply(update, "📊 No stats yet. Use the bot first!")
-        return
+        await safe_reply(update, "📊 No stats yet. Use the bot first!"); return
     await safe_reply(update,
-        f"📊 *Your Stats*\n\n"
-        f"Total operations: `{row['total_ops']}`\n"
-        f"Output DPI: `{row['dpi']}`\n\n"
-        f"_Your identity is stored as an anonymous hash.\n"
-        f"No timestamps, names, or Telegram ID are kept._"
-    )
+        f"📊 *Your Stats*\n\nTotal operations: `{row['total_ops']}`\nOutput DPI: `{row['dpi']}`\n\n"
+        f"_Your identity is stored as an anonymous hash.\nNo timestamps, names, or Telegram ID are kept._")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# ADMIN COMMANDS
+# ─────────────────────────────────────────────────────────────────────
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
-        await safe_reply(update, "❌ Access denied.")
-        return
-    stats  = get_bot_stats()
+        await safe_reply(update, "❌ Access denied."); return
+    stats = get_bot_stats()
     uptime = int(time.time() - BOT_START_TIME)
     await safe_reply(update,
-        f"🛠 *Admin Panel — {VERSION}*\n\n"
-        f"Uptime: `{uptime // 3600}h {(uptime % 3600) // 60}m`\n\n"
-        f"👥 Total users (hashed): `{stats['total_users']}`\n"
-        f"📊 Total ops (anonymous): `{stats['total_ops']}`\n\n"
-        f"_No personal data stored. Real IDs hashed. No op logs._"
-    )
+        f"🛠 *Admin Panel — {VERSION}*\n\nUptime: `{uptime//3600}h {(uptime%3600)//60}m`\n\n"
+        f"👥 Total users: `{stats['total_users']}`\n📊 Total ops: `{stats['total_ops']}`\n\n"
+        f"_No personal data stored. Real IDs hashed._")
 
 
 async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
-        await safe_reply(update, "❌ Access denied.")
-        return
+        await safe_reply(update, "❌ Access denied."); return
     if not ctx.args:
-        await safe_reply(update, "Usage: `/broadcast Your message here`")
-        return
+        await safe_reply(update, "Usage: `/broadcast Your message here`"); return
     message  = " ".join(ctx.args)
-    real_ids = list(_known_real_ids)  # RAM-only, never from DB
+    real_ids = list(_known_real_ids)
     if not real_ids:
-        await safe_reply(update, "⚠️ No active users in current session. Users must interact first.")
-        return
-    status = await update.message.reply_text(
-        f"📡 Broadcasting to {len(real_ids)} users seen this session..."
-    )
+        await safe_reply(update, "⚠️ No active users in current session."); return
+    status = await update.message.reply_text(f"📡 Broadcasting to {len(real_ids)} users...")
     sent = failed = 0
-    for chunk_start in range(0, len(real_ids), 30):
-        for rid in real_ids[chunk_start:chunk_start + 30]:
+    for i in range(0, len(real_ids), 30):
+        for rid in real_ids[i:i+30]:
             try:
-                await ctx.bot.send_message(
-                    chat_id=rid,
-                    text=f"📢 *Announcement*\n\n{message}",
-                    parse_mode="Markdown"
-                )
+                await ctx.bot.send_message(rid, f"📢 *Announcement*\n\n{message}", parse_mode="Markdown")
                 sent += 1
             except Exception:
                 failed += 1
@@ -1229,113 +1207,553 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
         conn.execute("INSERT INTO broadcasts(message, sent_at) VALUES(?,?)",
                      (message, datetime.utcnow().isoformat()))
-    await status.edit_text(f"✅ Done! Sent: `{sent}` | Failed: `{failed}`")
+    await status.edit_text(f"✅ Sent: `{sent}` | Failed: `{failed}`")
 
-
-
-
-# ─────────────────────────────────────────────────────────────────────
-# ADMIN: PRESET MANAGEMENT
-# ─────────────────────────────────────────────────────────────────────
 
 async def cmd_listpresets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
-        await safe_reply(update, "❌ Access denied.")
-        return
+        await safe_reply(update, "❌ Access denied."); return
     presets = db_list_all_presets()
     if not presets:
-        await safe_reply(update, "📋 No presets yet.")
-        return
-    lines = ["📋 *All Presets (Admin View)*\n"]
+        await safe_reply(update, "📋 No presets yet."); return
+    lines = ["📋 *All Presets*\n"]
     for p in presets:
         status = "✅" if p["active"] else "❌ deleted"
         lines.append(f"{status} `ID:{p['id']}` — {p['label']} — `{p['width_px']}×{p['height_px']}px`")
-    lines.append("\n`/addpreset Label | w | h`")
-    lines.append("`/editpreset ID | Label | w | h`")
-    lines.append("`/delpreset ID`")
+    lines.append("\n`/addpreset Label | w | h`\n`/editpreset ID | Label | w | h`\n`/delpreset ID`")
     await safe_reply(update, "\n".join(lines))
 
 
 async def cmd_addpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
-        await safe_reply(update, "❌ Access denied.")
-        return
+        await safe_reply(update, "❌ Access denied."); return
     raw   = " ".join(ctx.args) if ctx.args else ""
     parts = [p.strip() for p in raw.split("|")]
     if len(parts) != 3:
-        await safe_reply(update,
-            "📝 *Format:* `/addpreset Label | width | height`\n\n"
-            "*Example:* `/addpreset Railway 2025 | 413 | 531`")
-        return
+        await safe_reply(update, "📝 *Format:* `/addpreset Label | width | height`\n*Example:* `/addpreset Railway 2025 | 413 | 531`"); return
     label = parts[0].strip()
     try:
         w, h = int(parts[1].strip()), int(parts[2].strip())
-        if not (0 < w <= 5000 and 0 < h <= 5000):
-            raise ValueError
+        if not (0 < w <= 5000 and 0 < h <= 5000): raise ValueError
     except ValueError:
-        await safe_reply(update, "❌ Width/height must be valid numbers (1–5000 px).")
-        return
-    if not label:
-        await safe_reply(update, "❌ Label khali nahi hona chahiye.")
-        return
+        await safe_reply(update, "❌ Width/height must be valid numbers (1–5000 px)."); return
     new_id = db_add_preset(label, w, h)
-    await safe_reply(update,
-        f"✅ *Preset added!*\n🆔 ID:`{new_id}` — {label} — `{w}×{h}px`\n\n"
-        f"_Live immediately — no restart needed._")
+    await safe_reply(update, f"✅ *Preset added!*\n`ID:{new_id}` — {label} — `{w}×{h}px`\n_Live immediately._")
 
 
 async def cmd_editpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
-        await safe_reply(update, "❌ Access denied.")
-        return
+        await safe_reply(update, "❌ Access denied."); return
     raw   = " ".join(ctx.args) if ctx.args else ""
     parts = [p.strip() for p in raw.split("|")]
     if len(parts) != 4:
-        await safe_reply(update,
-            "📝 *Format:* `/editpreset ID | Label | width | height`\n\n"
-            "*Example:* `/editpreset 9 | Railway 2026 | 450 | 550`")
-        return
+        await safe_reply(update, "📝 *Format:* `/editpreset ID | Label | width | height`"); return
     try:
-        pid   = int(parts[0].strip())
-        label = parts[1].strip()
-        w, h  = int(parts[2].strip()), int(parts[3].strip())
-        if not (0 < w <= 5000 and 0 < h <= 5000):
-            raise ValueError
+        pid, label, w, h = int(parts[0]), parts[1].strip(), int(parts[2]), int(parts[3])
+        if not (0 < w <= 5000 and 0 < h <= 5000): raise ValueError
     except ValueError:
-        await safe_reply(update, "❌ ID aur dimensions valid numbers hone chahiye.")
-        return
+        await safe_reply(update, "❌ Invalid values."); return
     preset = db_get_preset_by_id(pid)
     if not preset:
-        await safe_reply(update, f"❌ ID `{pid}` not found.")
-        return
+        await safe_reply(update, f"❌ ID `{pid}` not found."); return
     db_edit_preset(pid, label, w, h)
-    await safe_reply(update,
-        f"✅ *Preset updated!*\n"
-        f"Before: {preset['label']} `{preset['width_px']}×{preset['height_px']}`\n"
-        f"After: {label} `{w}×{h}px`\n\n_Live immediately._")
+    await safe_reply(update, f"✅ Updated!\nBefore: {preset['label']} `{preset['width_px']}×{preset['height_px']}`\nAfter: {label} `{w}×{h}px`")
 
 
 async def cmd_delpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
-        await safe_reply(update, "❌ Access denied.")
-        return
+        await safe_reply(update, "❌ Access denied."); return
     if not ctx.args or not ctx.args[0].isdigit():
-        await safe_reply(update,
-            "📝 *Format:* `/delpreset ID`\n\n"
-            "*Example:* `/delpreset 3`")
-        return
+        await safe_reply(update, "📝 *Format:* `/delpreset ID`"); return
     pid    = int(ctx.args[0])
     preset = db_get_preset_by_id(pid)
     if not preset:
-        await safe_reply(update, f"❌ ID `{pid}` not found.")
-        return
+        await safe_reply(update, f"❌ ID `{pid}` not found."); return
     db_delete_preset(pid)
-    await safe_reply(update,
-        f"🗑 *Deleted:* {preset['label']} `{preset['width_px']}×{preset['height_px']}px`")
+    await safe_reply(update, f"🗑 Deleted: {preset['label']} `{preset['width_px']}×{preset['height_px']}px`")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MAIN FLOW HANDLERS
+# ─────────────────────────────────────────────────────────────────────
+async def select_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q   = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    _known_real_ids.add(uid)
+    if not check_rate_limit(uid):
+        await safe_edit(update, t("rate_limit", ctx)); return ConversationHandler.END
+    data = q.data
+    log_state(uid, "SELECT_ACTION", data)
+    if data == "bg_change":
+        if not acquire_lock(ctx):
+            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
+        asyncio.create_task(schedule_cleanup(ctx))
+        await safe_edit(update, t("send_photo", ctx))
+        return S.BG_WAIT_PHOTO
+    elif data == "resize":
+        await safe_edit(update, t("resize", ctx), resize_mode_kb(ctx))
+        return S.RESIZE_MODE
+    elif data == "signature":
+        if not acquire_lock(ctx):
+            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
+        asyncio.create_task(schedule_cleanup(ctx))
+        await safe_edit(update, t("send_photo", ctx))
+        return S.SIG_WAIT_PHOTO
+    return S.SELECT_ACTION
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BACKGROUND CHANGE FLOW
+# ─────────────────────────────────────────────────────────────────────
+async def bg_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    _known_real_ids.add(uid)
+    if not check_rate_limit(uid):
+        await safe_reply(update, t("rate_limit", ctx)); return ConversationHandler.END
+    img = await get_image(update)
+    if img == "too_large":
+        await safe_reply(update, t("file_too_large", ctx)); return S.BG_WAIT_PHOTO
+    if img in ("invalid", None):
+        await safe_reply(update, t("send_photo", ctx)); return S.BG_WAIT_PHOTO
+    blur = detect_blur(img)
+    if blur < BLUR_THRESHOLD:
+        await safe_reply(update, t("blur_warn", ctx))
+    face_warn = analyze_face(img)
+    if face_warn:
+        await safe_reply(update, t(face_warn, ctx))
+    secure_store(ctx, "bg_img", img)
+    await safe_reply(update, t("color_choose", ctx), bg_color_kb())
+    return S.BG_WAIT_COLOR
+
+
+async def bg_wait_color(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    color_text = None
+    if update.callback_query:
+        await update.callback_query.answer()
+        data = update.callback_query.data
+        if data == "col_custom":
+            await safe_edit(update, t("custom_color_prompt", ctx)); return S.BG_WAIT_COLOR
+        elif data.startswith("col_"):
+            color_text = data[4:]
+    elif update.message:
+        raw = update.message.text.strip()
+        if not validate_color(raw):
+            await safe_reply(update, f"❌ `{raw}` invalid. Try: `white`, `#FF0000`, `lightblue`")
+            return S.BG_WAIT_COLOR
+        color_text = raw
+    if not color_text:
+        return S.BG_WAIT_COLOR
+
+    img = secure_load(ctx, "bg_img")
+    if not img:
+        await safe_reply(update, t("error", ctx)); release_lock(ctx); return ConversationHandler.END
+
+    target = update.message or update.callback_query.message
+    proc   = await target.reply_text(t("processing", ctx))
+    try:
+        loop   = asyncio.get_running_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, person_segmentation_replace, img, color_text),
+            timeout=PROCESSING_TIMEOUT)
+        del img; gc.collect()
+        secure_store(ctx, "bg_result", result)
+        del result; gc.collect()
+    except asyncio.TimeoutError:
+        del img; gc.collect()
+        await proc.edit_text(t("timeout_err", ctx))
+        release_lock(ctx); await send_main_menu(update, ctx); return ConversationHandler.END
+    except Exception as e:
+        del img; gc.collect()
+        logger.error(f"bg_wait_color: {e}", exc_info=True)
+        await proc.edit_text(t("error", ctx))
+        release_lock(ctx); await send_main_menu(update, ctx); return ConversationHandler.END
+    await proc.delete()
+
+    preview_img = secure_load(ctx, "bg_result")
+    preview     = create_preview(preview_img.copy())
+    secure_store(ctx, "bg_result", preview_img)
+    del preview_img; gc.collect()
+
+    await target.reply_photo(photo=preview,
+        caption=f"{t('preview', ctx)}\n\n{t('bg_warning', ctx)}",
+        reply_markup=confirm_kb("bg_ok", "bg_retry", ctx), parse_mode="Markdown")
+    return S.BG_PREVIEW
+
+
+async def bg_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "bg_ok":
+        try: await q.edit_message_caption(caption=t("format_choose", ctx), reply_markup=format_kb(), parse_mode="Markdown")
+        except BadRequest: await q.message.reply_text(t("format_choose", ctx), reply_markup=format_kb())
+        return S.BG_WAIT_FORMAT
+    elif q.data == "bg_retry":
+        secure_wipe_all(ctx, ["bg_result"])
+        try: await q.message.delete()
+        except Exception: pass
+        release_lock(ctx)
+        if not acquire_lock(ctx): return ConversationHandler.END
+        await ctx.bot.send_message(q.message.chat_id, t("send_photo", ctx))
+        return S.BG_WAIT_PHOTO
+    return S.BG_PREVIEW
+
+
+async def bg_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q   = update.callback_query; await q.answer()
+    fmt = q.data.replace("fmt_", "")
+    uid = update.effective_user.id
+    result = secure_load(ctx, "bg_result")
+    if not result:
+        await safe_edit(update, t("error", ctx)); release_lock(ctx); return ConversationHandler.END
+    try:
+        buf      = save_image(result, fmt, ctx.user_data.get("dpi", DPI_DEFAULT))
+        size_str = format_size(buf.getbuffer().nbytes)
+        caption  = f"{t('bg_done', ctx)}\n📏 `{result.width}×{result.height}px` | 📦 `{size_str}`\n\n{t('reminder', ctx)}"
+        del result; gc.collect()
+        bump_op_count(uid)
+        await q.message.reply_document(document=io.BytesIO(buf.getvalue()),
+            filename=f"output.{fmt.lower()}", caption=caption, parse_mode="Markdown")
+        buf.close()
+    except Exception as e:
+        logger.error(f"bg_wait_format: {e}", exc_info=True)
+        await safe_edit(update, t("error", ctx))
+    finally:
+        secure_wipe_all(ctx, _IMAGE_KEYS); release_lock(ctx)
+        await send_main_menu(update, ctx)
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────
+# RESIZE FLOW
+# ─────────────────────────────────────────────────────────────────────
+async def resize_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data in ("resize_preset", "resize_custom"):
+        if not acquire_lock(ctx):
+            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
+        ctx.user_data["_resize_mode"] = "preset" if q.data == "resize_preset" else "custom"
+        asyncio.create_task(schedule_cleanup(ctx))
+        await safe_edit(update, t("send_photo", ctx))
+        return S.CUSTOM_WAIT_PHOTO
+    elif q.data == "resize_reduce":
+        if not acquire_lock(ctx):
+            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
+        asyncio.create_task(schedule_cleanup(ctx))
+        await safe_edit(update, t("reduce_send_photo", ctx))
+        return S.REDUCE_WAIT_PHOTO
+    return S.RESIZE_MODE
+
+
+async def custom_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    _known_real_ids.add(uid)
+    img = await get_image(update)
+    if img == "too_large":
+        await safe_reply(update, t("file_too_large", ctx)); return S.CUSTOM_WAIT_PHOTO
+    if img in ("invalid", None):
+        await safe_reply(update, t("send_photo", ctx)); return S.CUSTOM_WAIT_PHOTO
+    secure_store(ctx, "resize_img", img)
+    mode = ctx.user_data.get("_resize_mode", "custom")
+    if mode == "preset":
+        await safe_reply(update, t("select_preset", ctx), preset_kb())
+        return S.CUSTOM_SELECT_PRESET
+    else:
+        await safe_reply(update, t("dimensions", ctx))
+        return S.CUSTOM_WAIT_DIMS
+
+
+async def custom_select_preset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "preset_custom":
+        await safe_edit(update, t("dimensions", ctx)); return S.CUSTOM_WAIT_DIMS
+    try:
+        preset_id = int(q.data.replace("preset_", ""))
+    except ValueError:
+        return S.CUSTOM_SELECT_PRESET
+    preset = db_get_preset_by_id(preset_id)
+    if not preset:
+        await safe_edit(update, "❌ Preset not found."); await send_main_menu(update, ctx); return ConversationHandler.END
+    w, h, label = preset["width_px"], preset["height_px"], preset["label"]
+    img = secure_load(ctx, "resize_img")
+    if not img:
+        await safe_edit(update, t("error", ctx)); release_lock(ctx); return ConversationHandler.END
+    result = ImageOps.pad(img, (w, h), color=(255,255,255)) if ctx.user_data.get("strict") \
+             else img.resize((w, h), Image.Resampling.LANCZOS)
+    del img; gc.collect()
+    preview = create_preview(result.copy())
+    secure_store(ctx, "resize_result", result)
+    del result; gc.collect()
+    await q.message.reply_photo(photo=preview,
+        caption=f"{t('preview', ctx)}\n📋 *{label}*\n📏 `{w}×{h}px`",
+        reply_markup=confirm_kb("resize_ok", "resize_retry", ctx), parse_mode="Markdown")
+    return S.CUSTOM_PREVIEW
+
+
+async def custom_wait_dims(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    dims = parse_dimensions(update.message.text)
+    if not dims:
+        await safe_reply(update, t("dimensions", ctx)); return S.CUSTOM_WAIT_DIMS
+    w, h = dims
+    img  = secure_load(ctx, "resize_img")
+    if not img:
+        await safe_reply(update, t("error", ctx)); release_lock(ctx); return ConversationHandler.END
+    result = ImageOps.pad(img, (w, h), color=(255,255,255)) if ctx.user_data.get("strict") \
+             else img.resize((w, h), Image.Resampling.LANCZOS)
+    del img; gc.collect()
+    preview = create_preview(result.copy())
+    secure_store(ctx, "resize_result", result)
+    del result; gc.collect()
+    await update.message.reply_photo(photo=preview,
+        caption=f"{t('preview', ctx)}\n📏 `{w}×{h}px`",
+        reply_markup=confirm_kb("resize_ok", "resize_retry", ctx), parse_mode="Markdown")
+    return S.CUSTOM_PREVIEW
+
+
+async def custom_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "resize_ok":
+        try: await q.edit_message_caption(caption=t("size_option", ctx), reply_markup=size_option_kb(ctx), parse_mode="Markdown")
+        except BadRequest: await q.message.reply_text(t("size_option", ctx), reply_markup=size_option_kb(ctx))
+        return S.CUSTOM_SIZE_OPT
+    elif q.data == "resize_retry":
+        secure_wipe_all(ctx, ["resize_result"])
+        try: await q.message.delete()
+        except Exception: pass
+        release_lock(ctx)
+        if not acquire_lock(ctx): return ConversationHandler.END
+        await ctx.bot.send_message(q.message.chat_id, t("send_photo", ctx))
+        return S.CUSTOM_WAIT_PHOTO
+    return S.CUSTOM_PREVIEW
+
+
+async def custom_size_opt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "sizeopt_kb":
+        await safe_edit(update, t("enter_kb", ctx)); return S.CUSTOM_WAIT_KB
+    elif q.data == "sizeopt_save":
+        await safe_edit(update, t("format_choose", ctx), format_kb()); return S.CUSTOM_WAIT_FORMAT
+    return S.CUSTOM_SIZE_OPT
+
+
+async def custom_wait_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        val = int(re.sub(r"[^\d]", "", update.message.text))
+        if val <= 0: raise ValueError
+    except (ValueError, TypeError):
+        await safe_reply(update, t("enter_kb", ctx)); return S.CUSTOM_WAIT_KB
+    ctx.user_data["target_kb"] = val
+    await safe_reply(update, t("format_choose", ctx), format_kb())
+    return S.CUSTOM_WAIT_FORMAT
+
+
+async def custom_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q   = update.callback_query; await q.answer()
+    fmt = q.data.replace("fmt_", "")
+    uid = update.effective_user.id
+    result = secure_load(ctx, "resize_result")
+    if not result:
+        await safe_edit(update, t("error", ctx)); release_lock(ctx); return ConversationHandler.END
+    try:
+        target_kb = ctx.user_data.get("target_kb")
+        buf       = compress_to_kb(result, target_kb, fmt) if target_kb \
+                    else save_image(result, fmt, ctx.user_data.get("dpi", DPI_DEFAULT))
+        size_str  = format_size(buf.getbuffer().nbytes)
+        caption   = f"{t('resize_done', ctx)}\n📏 `{result.width}×{result.height}px` | 📦 `{size_str}`\n\n{t('reminder', ctx)}"
+        del result; gc.collect()
+        bump_op_count(uid)
+        await q.message.reply_document(document=io.BytesIO(buf.getvalue()),
+            filename=f"output.{fmt.lower()}", caption=caption, parse_mode="Markdown")
+        buf.close()
+    except Exception as e:
+        logger.error(f"custom_wait_format: {e}", exc_info=True)
+        await safe_edit(update, t("error", ctx))
+    finally:
+        secure_wipe_all(ctx, _IMAGE_KEYS)
+        ctx.user_data.pop("target_kb", None); ctx.user_data.pop("_resize_mode", None)
+        release_lock(ctx); await send_main_menu(update, ctx)
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────
+# REDUCE SIZE FLOW
+# ─────────────────────────────────────────────────────────────────────
+async def reduce_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    _known_real_ids.add(uid)
+    img = await get_image(update)
+    if img == "too_large":
+        await safe_reply(update, t("file_too_large", ctx)); return S.REDUCE_WAIT_PHOTO
+    if img in ("invalid", None):
+        await safe_reply(update, t("send_photo", ctx)); return S.REDUCE_WAIT_PHOTO
+    secure_store(ctx, "reduce_img", img)
+    await safe_reply(update, t("enter_kb", ctx))
+    return S.REDUCE_WAIT_KB
+
+
+async def reduce_wait_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        val = int(re.sub(r"[^\d]", "", update.message.text))
+        if val <= 0: raise ValueError
+    except (ValueError, TypeError):
+        await safe_reply(update, t("enter_kb", ctx)); return S.REDUCE_WAIT_KB
+    ctx.user_data["target_kb"] = val
+    await safe_reply(update, t("format_choose", ctx), format_kb())
+    return S.REDUCE_WAIT_FORMAT
+
+
+async def reduce_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q   = update.callback_query; await q.answer()
+    fmt = q.data.replace("fmt_", "")
+    uid = update.effective_user.id
+    img = secure_load(ctx, "reduce_img")
+    if not img:
+        await safe_edit(update, t("error", ctx)); release_lock(ctx); return ConversationHandler.END
+    target_kb = ctx.user_data.get("target_kb", 100)
+    proc = await q.message.reply_text(t("processing", ctx))
+    try:
+        loop = asyncio.get_running_loop()
+        buf  = await asyncio.wait_for(
+            loop.run_in_executor(None, compress_to_kb, img, target_kb, fmt),
+            timeout=PROCESSING_TIMEOUT)
+        size_str = format_size(buf.getbuffer().nbytes)
+        caption  = f"{t('compress_done', ctx)}\n📏 `{img.width}×{img.height}px` | 📦 `{size_str}`\n\n{t('reminder', ctx)}"
+        del img; gc.collect()
+        bump_op_count(uid)
+        await proc.delete()
+        await q.message.reply_document(document=io.BytesIO(buf.getvalue()),
+            filename=f"output.{fmt.lower()}", caption=caption, parse_mode="Markdown")
+        buf.close()
+    except asyncio.TimeoutError:
+        del img; gc.collect(); await proc.edit_text(t("timeout_err", ctx))
+    except Exception as e:
+        del img; gc.collect()
+        logger.error(f"reduce_wait_format: {e}", exc_info=True)
+        await proc.edit_text(t("error", ctx))
+    finally:
+        secure_wipe_all(ctx, _IMAGE_KEYS)
+        ctx.user_data.pop("target_kb", None)
+        release_lock(ctx); await send_main_menu(update, ctx)
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SIGNATURE FLOW
+# ─────────────────────────────────────────────────────────────────────
+async def sig_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    _known_real_ids.add(uid)
+    img = await get_image(update)
+    if img == "too_large":
+        await safe_reply(update, t("file_too_large", ctx)); return S.SIG_WAIT_PHOTO
+    if img in ("invalid", None):
+        await safe_reply(update, t("send_photo", ctx)); return S.SIG_WAIT_PHOTO
+    arr     = np.array(img.convert("RGB"))
+    corners = [arr[0,0], arr[0,-1], arr[-1,0], arr[-1,-1]]
+    if not all(v > 190 for v in np.mean(corners, axis=0)):
+        await safe_reply(update, t("sig_bg_warn", ctx))
+    proc = await update.message.reply_text(t("processing", ctx))
+    try:
+        loop   = asyncio.get_running_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, extract_signature, img),
+            timeout=PROCESSING_TIMEOUT)
+        del img; gc.collect()
+        preview = create_preview(result.copy())
+        secure_store(ctx, "sig_result", result)
+        del result; gc.collect()
+        await proc.delete()
+        await update.message.reply_photo(photo=preview, caption=t("preview", ctx),
+            reply_markup=confirm_kb("sig_ok", "sig_retry", ctx), parse_mode="Markdown")
+        return S.SIG_PREVIEW
+    except asyncio.TimeoutError:
+        del img; gc.collect(); await proc.edit_text(t("timeout_err", ctx))
+        release_lock(ctx); await send_main_menu(update, ctx); return ConversationHandler.END
+    except Exception as e:
+        del img; gc.collect()
+        logger.error(f"sig_wait_photo: {e}", exc_info=True)
+        await proc.edit_text(t("error", ctx))
+        release_lock(ctx); await send_main_menu(update, ctx); return ConversationHandler.END
+
+
+async def sig_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "sig_ok":
+        sig_fmt_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("PNG", callback_data="fmt_PNG"),
+            InlineKeyboardButton("PDF", callback_data="fmt_PDF"),
+        ]])
+        try: await q.edit_message_caption(caption=t("format_choose", ctx), reply_markup=sig_fmt_kb, parse_mode="Markdown")
+        except BadRequest: await q.message.reply_text(t("format_choose", ctx), reply_markup=sig_fmt_kb)
+        return S.SIG_WAIT_FORMAT
+    elif q.data == "sig_retry":
+        secure_wipe_all(ctx, ["sig_result"])
+        try: await q.message.delete()
+        except Exception: pass
+        release_lock(ctx)
+        if not acquire_lock(ctx): return ConversationHandler.END
+        await ctx.bot.send_message(q.message.chat_id, t("send_photo", ctx))
+        return S.SIG_WAIT_PHOTO
+    return S.SIG_PREVIEW
+
+
+async def sig_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q   = update.callback_query; await q.answer()
+    fmt = q.data.replace("fmt_", "")
+    uid = update.effective_user.id
+    result = secure_load(ctx, "sig_result")
+    if not result:
+        await safe_edit(update, t("error", ctx)); release_lock(ctx); return ConversationHandler.END
+    try:
+        buf = io.BytesIO()
+        if fmt == "PNG": result.save(buf, format="PNG")
+        else: result.convert("RGB").save(buf, format="PDF")
+        buf.seek(0)
+        size_str = format_size(buf.getbuffer().nbytes)
+        caption  = f"{t('sig_done', ctx)}\n📦 `{size_str}` | 🖼 `{fmt}`\n\n{t('reminder', ctx)}"
+        del result; gc.collect()
+        bump_op_count(uid)
+        await q.message.reply_document(document=io.BytesIO(buf.getvalue()),
+            filename=f"signature.{fmt.lower()}", caption=caption, parse_mode="Markdown")
+        buf.close()
+    except Exception as e:
+        logger.error(f"sig_wait_format: {e}", exc_info=True)
+        await safe_edit(update, t("error", ctx))
+    finally:
+        secure_wipe_all(ctx, _IMAGE_KEYS)
+        release_lock(ctx); await send_main_menu(update, ctx)
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FALLBACKS & ERROR HANDLER
+# ─────────────────────────────────────────────────────────────────────
+async def conversation_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message:
+        await safe_reply(update, t("unexpected", ctx))
+        await send_main_menu(update, ctx)
+    return S.SELECT_ACTION
+
+
+async def global_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        _known_real_ids.add(update.effective_user.id)
+    await send_main_menu(update, ctx)
+
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    err = ctx.error
+    logger.error(f"Unhandled error: {err}", exc_info=err)
+    if isinstance(err, (TimedOut, NetworkError, RetryAfter)):
+        return
+    if update and hasattr(update, "effective_chat") and update.effective_chat:
+        try:
+            await ctx.bot.send_message(update.effective_chat.id, "⚠️ Unexpected error. Please /start again.")
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1353,7 +1771,7 @@ signal.signal(signal.SIGINT,  handle_signal)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# POST INIT — register commands, warm up model
+# POST INIT
 # ─────────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
     public_commands = [
@@ -1378,9 +1796,7 @@ async def post_init(application: Application):
     for admin_id in ADMIN_IDS:
         try:
             await application.bot.set_my_commands(
-                admin_commands,
-                scope={"type": "chat", "chat_id": admin_id}
-            )
+                admin_commands, scope={"type": "chat", "chat_id": admin_id})
         except Exception:
             pass
     logger.info("Bot commands registered.")
@@ -1393,21 +1809,16 @@ async def post_init(application: Application):
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        logger.error("BOT_TOKEN environment variable not set!")
-        sys.exit(1)
-
+        logger.error("BOT_TOKEN not set!"); sys.exit(1)
     if _UID_SALT == "change-this-salt-in-production":
-        logger.warning("⚠️  UID_SALT env var not set! Set a random secret in Render env vars.")
-
+        logger.warning("⚠️  UID_SALT env var not set!")
     init_db()
     logger.info(f"Database ready: {DB_PATH}")
-
     threading.Thread(target=run_flask, daemon=True).start()
-    logger.info(f"Flask health server starting on port {os.environ.get('PORT', 8080)}")
+    logger.info(f"Flask health server on port {os.environ.get('PORT', 8080)}")
 
     application = Application.builder().token(token).post_init(post_init).build()
 
-    # Standalone commands
     for cmd, fn in [
         ("help",        cmd_help),
         ("privacy",     cmd_privacy),
@@ -1424,7 +1835,6 @@ def main():
     ]:
         application.add_handler(CommandHandler(cmd, fn))
 
-    # Main conversation
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -1465,10 +1875,7 @@ def main():
     application.add_error_handler(error_handler)
 
     logger.info(f"🚀 {VERSION} starting — privacy-first mode active")
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
