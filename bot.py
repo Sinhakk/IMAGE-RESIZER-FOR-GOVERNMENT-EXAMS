@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      IMAGE UTILITY BOT  —  PRODUCTION  v6.0                      ║
+║      IMAGE UTILITY BOT  —  PRODUCTION  v6.1                      ║
 ║      Government Exam Photo Helper                                ║
 ║                                                                  ║
 ║  CORE:                                                           ║
@@ -14,11 +14,11 @@
 ║   • Auto-Enhance (white balance + CLAHE + micro-sharpen)         ║
 ║   • Quality Report before every op (trust builder)               ║
 ║   • HEIC / iPhone support                                        ║
+║   • /history — encrypted last-result resend (persistent)         ║
 ║                                                                  ║
 ║  PRIVACY:                                                        ║
 ║   • AES-256-GCM RAM encryption, real bytearray zero-wipe         ║
 ║   • Hashed user IDs, anonymous analytics, nothing on disk        ║
-║   • /history — encrypted last result resend                      ║
 ║                                                                  ║
 ║  INFRA: Render.com ready (Flask health + polling)                ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -68,7 +68,7 @@ from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
 # ─────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────
-VERSION          = "v6.0-production"
+VERSION          = "v6.1-production"
 DPI_DEFAULT      = 300
 MAX_QUALITY      = 95
 MIN_QUALITY      = 10
@@ -76,7 +76,8 @@ PREVIEW_MAX_SIZE = (512, 512)
 BLUR_THRESHOLD   = 80
 MAX_IMAGE_DIM    = 4096
 MIN_DIM          = 16
-PROCESSING_TIMEOUT = 90          # noise-search + binary search need headroom
+NOISE_MAX_PIXELS = 4_000_000     # noise-injection cap — 512MB RAM safety
+PROCESSING_TIMEOUT = 90
 RATE_LIMIT_REQ   = 8
 RATE_LIMIT_SECS  = 60
 MAX_FILE_SIZE_MB = 20
@@ -102,7 +103,7 @@ def hash_uid(telegram_id: int) -> str:
     return hashlib.sha256(f"{_UID_SALT}:{telegram_id}".encode("utf-8")).hexdigest()
 
 class SecureBuffer:
-    """AES-256-GCM holder. bytearray = real zero-wipe (immutable bytes nahi)."""
+    """AES-256-GCM holder. bytearray = real zero-wipe."""
     __slots__ = ("_ct", "_nonce", "_wiped")
 
     def __init__(self, plaintext: bytes):
@@ -139,6 +140,7 @@ class SecureBuffer:
             pass
 
 def secure_store(ctx, key: str, img: Image.Image):
+    """PIL Image → PNG bytes → encrypted buffer. Original deref'd."""
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     data = buf.getvalue()
@@ -150,6 +152,7 @@ def secure_store(ctx, key: str, img: Image.Image):
     gc.collect()
 
 def secure_load(ctx, key: str) -> Optional[Image.Image]:
+    """Pop + decrypt + PIL copy + wipe. Single-use by design."""
     sbuf = ctx.user_data.pop(key, None)
     if not isinstance(sbuf, SecureBuffer):
         return None
@@ -171,12 +174,22 @@ def secure_peek(ctx, key: str) -> Optional[bytes]:
     except RuntimeError:
         return None
 
+def secure_wipe_all(ctx, keys: list):
+    """user_data se values nikalo; SecureBuffers properly wipe karo."""
+    for key in keys:
+        val = ctx.user_data.pop(key, None)
+        if isinstance(val, SecureBuffer):
+            val.wipe()
+    gc.collect()
+
+# Session-processing keys — har operation ke baad wipe hote hain.
+# NOTE: hist_buf YAHAAN NAHI hai — /history ko result ke baad bhi
+# kaam karna hai; wo sirf nayi result aane pe replace hota hai.
 _IMAGE_KEYS = [
     "bg_img", "bg_result",
     "resize_img", "resize_result",
     "reduce_img", "sig_result",
-    "size_img",                       # Exact Size Match source
-    "hist_buf",
+    "size_img",
 ]
 
 def _wipe_session_key():
@@ -367,7 +380,6 @@ def get_face_detector():
     with _mp_init_lock:
         if _mp_face is None and MP_OK:
             logger.info("Warming up MediaPipe face detection...")
-            # model_selection=0 → short-range (ID photo = selfie distance) = best
             _mp_face = mp.solutions.face_detection.FaceDetection(
                 model_selection=0, min_detection_confidence=0.5)
     return _mp_face
@@ -462,12 +474,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "ai_unavailable":      "⚠️ AI model load nahi hua. Admin ko batao.",
         "lang_hi":             "✅ Hinglish ON! 🇮🇳",
         "lang_en":             "✅ English ON! 🇬🇧",
-        # ── Quality report (compact, trust-builder) ──
         "q_ok":                "✨ Quality check: Sharp ✓ Lighting ✓",
         "q_dark":              "🌑 Dark thi — auto-brightness laga di.",
         "q_bright":            "☀️ Overexposed thi — auto-fix laga di.",
         "q_flat":              "🌒 Contrast low tha — auto-enhance laga di.",
-        # ── EXACT SIZE MATCH ──
         "size_send_photo":     "📸 Wo photo bhejo jiska SIZE match karna hai:\n\n🔒 Resolution 100% SAME rahegi — koi resize NAHI.",
         "size_enter_kb":       "📦 *EXACT* target size batao (KB):\nExample: `100` ya `150kb` ya `0.5mb`\n\n💡 Size KAM ya ZYADA dono ho sakta hai — resolution same rahegi.",
         "size_fmt_choose":     "📁 Format chuno (JPEG recommended — exact size hit hota hai):",
@@ -476,7 +486,6 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "size_max_warn":       "⚠️ Itna bada size possible nahi — max reached, best de diya.",
         "size_q_warn":         "ℹ️ Target ke liye compression thodi zyada lagi (q{q}).",
         "size_info":           "📐 Resolution: `{w}×{h}` (UNCHANGED)\n📦 Size: `{size}` (target: `{target}`)\n🎚 JPEG quality: `q{q}`",
-        # ── PRINT SHEET ──
         "sheet_send_photo":    "📸 Photo bhejo — 4×6\" sheet pe *8 passport photos* (cut lines ke saath) ban jayegi:",
         "sheet_done":          "🖨 *Print sheet ready!*\n📄 4×6\" | 8 photos | Passport 35×45mm\n\n💡 Print shop ko JPEG do ya PDF print karo.",
         "privacy_notice": (
@@ -662,6 +671,7 @@ def new_op_token(ctx) -> str:
     return tok
 
 def cleanup_session(ctx):
+    """Operation data wipe — history (hist_buf) JAAN-BOOJH KE preserve hoti hai."""
     secure_wipe_all(ctx, _IMAGE_KEYS + ["target_kb", "_resize_mode"])
     ctx.user_data["_op"] = None
     release_lock(ctx)
@@ -701,7 +711,7 @@ def ensure_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB") if img.mode != "RGB" else img
 
 def flatten_on_white(img: Image.Image) -> Image.Image:
-    """RGBA/LA → RGB over white. JPEG/PDF/preview ke liye (black-box bug killer)."""
+    """RGBA/LA → RGB over white. JPEG/PDF/preview ke liye (black-box killer)."""
     if img.mode in ("RGBA", "LA", "PA"):
         img = img.convert("RGBA")
         bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -758,7 +768,6 @@ def analyze_quality(img: Image.Image) -> Dict[str, Any]:
     return {"blur": blur, "brightness": bright, "contrast": contrast, "issues": issues}
 
 def quality_feedback(img: Image.Image, ctx) -> str:
-    """Ek compact message — sab checks merge. Trust-builder."""
     q = analyze_quality(img)
     parts = []
     if "blur" in q["issues"]:
@@ -1156,8 +1165,7 @@ def match_file_size_kb(img: Image.Image, target_kb: int,
         return io.BytesIO(best_data), {"warn": warn,
                                        "quality": "colors-reduced" if reduced else "lossless"}
 
-    # ── JPEG ──
-    # Phase A: quality binary search
+    # ── JPEG Phase A: quality binary search ──
     best_data, best_q = None, None
     lo, hi = MIN_QUALITY, MAX_QUALITY
     while lo <= hi:
@@ -1174,13 +1182,13 @@ def match_file_size_kb(img: Image.Image, target_kb: int,
             hi = mid - 1
 
     if best_data is None:
-        # MIN_QUALITY pe bhi bada hai — resolution nahi badlenge (user ka rule)
+        # MIN_QUALITY pe bhi bada hai — resolution NAHI badlenge (user ka rule)
         data = _jpeg_encode(src, MIN_QUALITY)
         return io.BytesIO(data), {"quality": MIN_QUALITY, "warn": "min"}
 
-    # Phase B: SIZE BADHANA hai → grain noise injection (invisible, ≤10MP safe)
+    # ── JPEG Phase B: SIZE BADHANA → grain noise (≤4MP memory-safe) ──
     best_up = None
-    if src.width * src.height <= 9_000_000:
+    if src.width * src.height <= NOISE_MAX_PIXELS:
         rng = np.random.default_rng(42)                        # deterministic
         noise1 = rng.standard_normal((src.height, src.width, 3)).astype(np.float32)
         arr0 = np.array(src).astype(np.float32)
@@ -1193,7 +1201,7 @@ def match_file_size_kb(img: Image.Image, target_kb: int,
                 best_up = data; lo_s = mid_s
             else:
                 hi_s = mid_s
-        if abs(len(best_up or b"") - target) <= target * 0.05:
+        if best_up is not None and abs(len(best_up) - target) <= target * 0.05:
             return io.BytesIO(best_up), {"quality": MAX_QUALITY,
                                          "noise": round(lo_s, 1), "warn": None}
 
@@ -1208,10 +1216,6 @@ def match_file_size_kb(img: Image.Image, target_kb: int,
 def make_photo_sheet(img: Image.Image, dpi: int = 300,
                      cols: int = 4, rows: int = 2,
                      gap_mm: float = 2.0) -> Image.Image:
-    """
-    4×6\" landscape @300dpi = 1800×1200.
-    4 cols × 2 rows, har cell ~420×564px (35×45mm ke kareeb), cut lines.
-    """
     cw, ch = int(6.0 * dpi), int(4.0 * dpi)          # landscape
     gap = int(gap_mm / 25.4 * dpi)
     cell_w = (cw - (cols + 1) * gap) // cols
@@ -1306,18 +1310,21 @@ async def send_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def log_state(uid: int, state: str, action: str):
     logger.info(f"STATE={state} | {action}")
 
-async def deliver_result(update: Update, ctx, chat_msg, data: bytes, filename: str,
-                         dims: Tuple[int, int], done_key: str,
-                         extra_info: str = ""):
-    size_str = format_size(len(data))
-    caption = (f"{t(done_key, ctx)}\n"
-               f"📏 `{dims[0]}×{dims[1]}px` | 📦 `{size_str}`\n"
-               f"{extra_info}\n\n{t('reminder', ctx)}")
+def _store_history(ctx, data: bytes, filename: str):
+    """Nayi result store karo — purani wipe (RAM hygiene)."""
     old = ctx.user_data.pop("hist_buf", None)
     if isinstance(old, SecureBuffer):
         old.wipe()
     ctx.user_data["hist_buf"]  = SecureBuffer(data)
     ctx.user_data["hist_name"] = filename
+
+async def deliver_result(update: Update, ctx, chat_msg, data: bytes, filename: str,
+                         dims: Tuple[int, int], done_key: str):
+    size_str = format_size(len(data))
+    caption = (f"{t(done_key, ctx)}\n"
+               f"📏 `{dims[0]}×{dims[1]}px` | 📦 `{size_str}`\n\n"
+               f"{t('reminder', ctx)}")
+    _store_history(ctx, data, filename)
     await asyncio.to_thread(bump_op_count, update.effective_user.id)
     await chat_msg.reply_document(document=io.BytesIO(data), filename=filename,
                                   caption=caption, parse_mode="Markdown")
@@ -1358,7 +1365,6 @@ def format_kb(include_pdf: bool = True) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([row])
 
 def size_fmt_kb() -> InlineKeyboardMarkup:
-    """Size Match: JPEG/PNG only — PDF yahan meaningless."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("JPEG ⭐", callback_data="fmt_JPEG"),
         InlineKeyboardButton("PNG",    callback_data="fmt_PNG")]])
@@ -1628,11 +1634,10 @@ async def bg_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if img in ("invalid", None):
         await safe_reply(update, t("invalid_file" if img == "invalid" else "no_photo", ctx))
         return S.BG_WAIT_PHOTO
-    # Quality report (ek compact message — spam nahi)
     await safe_reply(update, quality_feedback(img, ctx))
     if (fw := analyze_face(img)):
         await safe_reply(update, t(fw, ctx))
-    img = auto_enhance(img)                    # studio-grade base
+    img = auto_enhance(img)
     secure_store(ctx, "bg_img", img)
     await safe_reply(update, t("color_choose", ctx), bg_color_kb())
     return S.BG_WAIT_COLOR
@@ -2113,15 +2118,10 @@ async def size_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
             warn_txt = "\n" + t(warn_keys[meta["warn"]], ctx)
         elif meta.get("warn") == "quality":
             warn_txt = "\n" + t("size_q_warn", ctx).format(q=meta.get("quality", "?"))
-        extra = info + warn_txt
+        caption = f"{t('size_done', ctx)}\n{info}{warn_txt}\n\n{t('reminder', ctx)}"
 
-        old = ctx.user_data.pop("hist_buf", None)
-        if isinstance(old, SecureBuffer):
-            old.wipe()
-        ctx.user_data["hist_buf"] = SecureBuffer(data)
-        ctx.user_data["hist_name"] = f"photo_{target_kb}kb.{fmt.lower()}"
+        _store_history(ctx, data, f"photo_{target_kb}kb.{fmt.lower()}")
         await asyncio.to_thread(bump_op_count, update.effective_user.id)
-        caption = (f"{t('size_done', ctx)}\n{info}{warn_txt}\n\n{t('reminder', ctx)}")
         await q.message.reply_document(
             document=io.BytesIO(data),
             filename=f"photo_{target_kb}kb.{fmt.lower()}",
@@ -2172,11 +2172,7 @@ async def sheet_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
         del sheet; gc.collect()
 
         await proc.delete()
-        old = ctx.user_data.pop("hist_buf", None)
-        if isinstance(old, SecureBuffer):
-            old.wipe()
-        ctx.user_data["hist_buf"]  = SecureBuffer(jpg_data)
-        ctx.user_data["hist_name"] = "print_sheet_4x6.jpg"
+        _store_history(ctx, jpg_data, "print_sheet_4x6.jpg")
         await asyncio.to_thread(bump_op_count, update.effective_user.id)
         await update.message.reply_document(
             document=io.BytesIO(jpg_data), filename="print_sheet_4x6.jpg",
@@ -2187,14 +2183,10 @@ async def sheet_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     except asyncio.TimeoutError:
         del img; gc.collect()
         await proc.edit_text(t("timeout_err", ctx))
-        cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
     except Exception as e:
         del img; gc.collect()
         logger.error(f"sheet_wait_photo: {e}", exc_info=True)
         await proc.edit_text(t("error", ctx))
-        cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
     finally:
         cleanup_session(ctx)
         await send_main_menu(update, ctx)
