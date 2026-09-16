@@ -1,23 +1,8 @@
-# ═══════════════════════════════════════════════════
-#  Image Utility Bot v6.0 — pinned dependencies
-#  Python 3.11 compatible (mediapipe cp311 wheels ✓)
-# ═══════════════════════════════════════════════════
-
-# ── Bot Core ──
 python-telegram-bot==21.6
 flask==3.0.3
-
-# ── Vision / AI ──
+waitress==3.0.0
 mediapipe==0.10.14
-# ⚠️ opencv ALAG SE install MAT karna — mediapipe
-#    opencv-contrib-python khud laata hai. Dono ek
-#    saath = cv2 module conflict/corruption.
 numpy==1.26.4
-# ⚠️ numpy <2 pin — mediapipe + opencv 1.x expect karte hain
-
-# ── Image Processing ──
 Pillow==10.4.0
 pillow-heif==0.13.0
-
-# ── Security (AES-256-GCM) ──
 cryptography==43.0.1
