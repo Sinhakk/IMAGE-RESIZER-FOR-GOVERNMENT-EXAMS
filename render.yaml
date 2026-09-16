@@ -1,15 +1,27 @@
+# ═══════════════════════════════════════════════════════════
+#  Image Utility Bot v6.5 — Render Blueprint
+#  Deploy: Render Dashboard → New → Blueprint → repo select
+# ═══════════════════════════════════════════════════════════
 services:
   - type: web
     name: image-utility-bot
     runtime: docker
-    plan: free
+    plan: free                    # upgrade: starter (2GB RAM) multi-users ke liye
     healthCheckPath: /health
+    autoDeploy: true              # push → auto deploy
     envVars:
       - key: BOT_TOKEN
-        sync: false          # Render dashboard mein manually daalo
+        sync: false               # Render dashboard mein manually daalo
       - key: ADMIN_IDS
-        sync: false          # e.g. "123456789"
+        sync: false               # e.g. "123456789" — @userinfobot se milega
       - key: UID_SALT
-        generateValue: true  # auto random secure salt
+        generateValue: true       # auto random secure salt
       - key: DB_PATH
         value: /tmp/imagebot.db
+    # ── FUTURE (free tier pe NAHI chalega — uncomment sirf Starter plan pe):
+    # disk:
+    #   name: bot-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
+    # Aur tab DB_PATH env var change karke: /var/data/imagebot.db
+    # (restart pe presets/stats persist honge)
