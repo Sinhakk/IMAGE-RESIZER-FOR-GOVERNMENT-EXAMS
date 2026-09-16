@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      IMAGE UTILITY BOT  —  PRODUCTION  v6.1                      ║
+║      IMAGE UTILITY BOT  —  PRODUCTION  v6.5  (fully audited)     ║
 ║      Government Exam Photo Helper                                ║
 ║                                                                  ║
 ║  CORE:                                                           ║
-║   • AI Background Change (guided-filter edges, NO halo)          ║
-║   • Face-Aware Passport Crop (govt-spec 70% face positioning)    ║
-║   • Signature v2 (hysteresis threshold — NO broken strokes)      ║
-║   • Binary-Search Compress (exact KB, ±2%)                       ║
-║   • 🎯 EXACT SIZE MATCH — same resolution, exact KB (up OR down) ║
-║   • 🖨 Print Sheet — 8 passport photos on 4×6" (JPEG + PDF)      ║
-║   • Auto-Enhance (white balance + CLAHE + micro-sharpen)         ║
-║   • Quality Report before every op (trust builder)               ║
-║   • HEIC / iPhone support                                        ║
-║   • /history — encrypted last-result resend (persistent)         ║
+║   • AI BG Change v6.2 (trimap matting + color decontamination)   ║
+║   • Face-Aware Passport Crop v6.5 (crop-in-source: zero giant    ║
+║     intermediates, exact govt-spec positioning at ANY scale)     ║
+║   • Print Sheet (8 photos, 4×6", sanity fallback)                ║
+║   • Signature v2.1 (hysteresis + auto-downscale + empty-detect)  ║
+║   • Binary-Search Compress (±2%)                                 ║
+║   • 🎯 EXACT SIZE MATCH — same resolution, KB up OR down         ║
+║   • Auto-Enhance (gentle for faces) + Quality Report             ║
+║   • HEIC support • /history encrypted resend                     ║
 ║                                                                  ║
-║  PRIVACY:                                                        ║
-║   • AES-256-GCM RAM encryption, real bytearray zero-wipe         ║
-║   • Hashed user IDs, anonymous analytics, nothing on disk        ║
+║  v6.5 AUDIT FIXES:                                               ║
+║   • resize_mode double-answer BadRequest — FIXED                 ║
+║   • First-visit user DB row now ALWAYS created (stats correct)   ║
+║   • passport_crop memory bomb eliminated (no 2x-cap distortion)  ║
+║   • Image decode moved off event loop (no multi-user freezes)    ║
+║   • Signature auto-downscale >2000px (10× faster on big scans)   ║
+║   • Idle-expiry now deletes ghost prompt + notifies              ║
+║   • Empty-signature warning • dead code removed                  ║
 ║                                                                  ║
-║  INFRA: Render.com ready (Flask health + polling)                ║
+║  PRIVACY: AES-256-GCM RAM • hashed IDs • nothing on disk         ║
+║  INFRA: Render.com ready (waitress health + polling)             ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 # ─────────────────────────────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────────
-import os, io, re, cv2, sqlite3, logging, time, asyncio, gc, signal
+import os, io, re, cv2, sqlite3, logging, time, asyncio, gc
 import sys, threading, hashlib
 from enum import Enum
 from uuid import uuid4
@@ -42,7 +47,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import numpy as np
 from PIL import Image, ImageColor, ImageOps, ImageDraw
 
-# HEIC (iPhone) — optional
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
@@ -50,12 +54,17 @@ try:
 except ImportError:
     HEIC_OK = False
 
-# MediaPipe — optional (graceful degradation)
 try:
     import mediapipe as mp
     MP_OK = True
 except ImportError:
     MP_OK = False
+
+try:
+    from waitress import serve as _waitress_serve
+    WAITRESS_OK = True
+except ImportError:
+    WAITRESS_OK = False
 
 from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -68,15 +77,16 @@ from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
 # ─────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────
-VERSION          = "v6.1-production"
+VERSION          = "v6.5-production"
 DPI_DEFAULT      = 300
 MAX_QUALITY      = 95
 MIN_QUALITY      = 10
 PREVIEW_MAX_SIZE = (512, 512)
-BLUR_THRESHOLD   = 80
 MAX_IMAGE_DIM    = 4096
 MIN_DIM          = 16
-NOISE_MAX_PIXELS = 4_000_000     # noise-injection cap — 512MB RAM safety
+BG_MAX_DIM       = 2048           # BG-change memory guard (512MB tier)
+SIG_MAX_DIM      = 2000           # signature scan cap — bilateral filter speed
+NOISE_MAX_PIXELS = 4_000_000      # noise-injection cap — RAM safety
 PROCESSING_TIMEOUT = 90
 RATE_LIMIT_REQ   = 8
 RATE_LIMIT_SECS  = 60
@@ -90,8 +100,6 @@ BOT_START_TIME   = time.time()
 
 # ─────────────────────────────────────────────────────────────────────
 # PRIVACY CORE — AES-256-GCM
-# Ciphertext in mutable bytearray → real in-place zero-wipe possible.
-# Plaintext lifetime: decrypt → use → del → gc. Session key RAM-only.
 # ─────────────────────────────────────────────────────────────────────
 _SESSION_KEY: bytes = AESGCM.generate_key(bit_length=256)
 _AESGCM               = AESGCM(_SESSION_KEY)
@@ -118,7 +126,7 @@ class SecureBuffer:
 
     def wipe(self):
         if not self._wiped:
-            self._ct[:]    = b"\x00" * len(self._ct)   # in-place C-level fill
+            self._ct[:]    = b"\x00" * len(self._ct)
             self._nonce[:] = b"\x00" * 12
             self._wiped = True
             gc.collect()
@@ -140,19 +148,15 @@ class SecureBuffer:
             pass
 
 def secure_store(ctx, key: str, img: Image.Image):
-    """PIL Image → PNG bytes → encrypted buffer. Original deref'd."""
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     data = buf.getvalue()
     buf.close()
-    del img
-    gc.collect()
     ctx.user_data[key] = SecureBuffer(data)
     del data
     gc.collect()
 
 def secure_load(ctx, key: str) -> Optional[Image.Image]:
-    """Pop + decrypt + PIL copy + wipe. Single-use by design."""
     sbuf = ctx.user_data.pop(key, None)
     if not isinstance(sbuf, SecureBuffer):
         return None
@@ -165,7 +169,6 @@ def secure_load(ctx, key: str) -> Optional[Image.Image]:
         return None
 
 def secure_peek(ctx, key: str) -> Optional[bytes]:
-    """Decrypt WITHOUT wipe — /history ke liye reusable."""
     sbuf = ctx.user_data.get(key)
     if not isinstance(sbuf, SecureBuffer):
         return None
@@ -175,16 +178,20 @@ def secure_peek(ctx, key: str) -> Optional[bytes]:
         return None
 
 def secure_wipe_all(ctx, keys: list):
-    """user_data se values nikalo; SecureBuffers properly wipe karo."""
     for key in keys:
         val = ctx.user_data.pop(key, None)
         if isinstance(val, SecureBuffer):
             val.wipe()
     gc.collect()
 
-# Session-processing keys — har operation ke baad wipe hote hain.
-# NOTE: hist_buf YAHAAN NAHI hai — /history ko result ke baad bhi
-# kaam karna hai; wo sirf nayi result aane pe replace hota hai.
+# Async wrappers — PNG encode/decode HEAVY, hamesha thread mein
+async def a_secure_store(ctx, key: str, img: Image.Image):
+    await asyncio.to_thread(secure_store, ctx, key, img)
+
+async def a_secure_load(ctx, key: str) -> Optional[Image.Image]:
+    return await asyncio.to_thread(secure_load, ctx, key)
+
+# Session keys — har op ke baad wipe. hist_buf YAHAAN NAHI (history survives).
 _IMAGE_KEYS = [
     "bg_img", "bg_result",
     "resize_img", "resize_result",
@@ -347,15 +354,15 @@ def get_bot_stats() -> Dict[str, Any]:
         ops   = conn.execute("SELECT SUM(total_ops) FROM users").fetchone()[0] or 0
     return {"total_users": users, "total_ops": ops}
 
-_known_real_ids: set = set()          # RAM-only, broadcast ke liye
+_known_real_ids: set = set()
 
 # ─────────────────────────────────────────────────────────────────────
-# MEDIAPIPE — thread-safe singletons (segmentation + face detection)
+# MEDIAPIPE — thread-safe singletons
 # ─────────────────────────────────────────────────────────────────────
 _mp_model = None
 _mp_face  = None
 _mp_init_lock = Lock()
-_mp_seg_lock  = Lock()      # process() NOT thread-safe — serialize
+_mp_seg_lock  = Lock()
 _mp_face_lock = Lock()
 
 def get_segmentation_model():
@@ -397,7 +404,7 @@ def warm_up_model():
         threading.Thread(target=get_face_detector, daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────────────
-# FLASK HEALTH
+# FLASK / WAITRESS HEALTH
 # ─────────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 _bot_healthy = True
@@ -416,8 +423,11 @@ def health():
         else (jsonify({"status": "degraded"}), 503)
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)),
-                  debug=False, use_reloader=False)
+    port = int(os.environ.get("PORT", 8080))
+    if WAITRESS_OK:
+        _waitress_serve(flask_app, host="0.0.0.0", port=port, threads=4)
+    else:
+        flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ─────────────────────────────────────────────────────────────────────
 # LANGUAGE
@@ -436,7 +446,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "looks_ok":            "✅ Theek hai — aage badho",
         "retry":               "🔁 Dobara try karo",
         "format_choose":       "📁 Format select karo:",
-        "dimensions":          "📐 Dimensions batao (koi bhi unit):\n• Pixels: `300x400`\n• Centimeters: `3.5x4.5cm`\n• Millimeters: `35x45mm`\n• Inches: `2x2in`",
+        "dimensions":          "📐 Dimensions batao (koi bhi format):\n• `300x400` ya `300x400px`\n• `3.5x4.5cm` ya `3.5cm x 4.5cm`\n• `35x45mm`\n• `2x2in`",
         "color_choose":        "🎨 Background color select karo:",
         "custom_color_prompt": "🖊 Color type karo (naam ya hex):\nExamples: `white`, `blue`, `#E8F4FD`",
         "enter_kb":            "📦 Target size batao:\nExample: `100` (KB), `1.5mb`",
@@ -449,6 +459,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "face_small":          "⚠️ Face chhota hai — closer photo better rahegi.",
         "face_offcenter":      "⚠️ Face center mein nahi — framing sudhaaro.",
         "sig_bg_warn":         "⚠️ Background safed nahi lag raha. Safed paper best rahega.",
+        "sig_empty_warn":      "⚠️ Koi signature detect NAHI hua — photo clear nahi hai ya ink bahut light hai. 🔁 se dobara try karo.",
         "bg_warning":          "ℹ️ AI result — preview dhyan se check karo.",
         "reminder":            "⚠️ Upload se *pehle* result verify karo.",
         "rate_limit":          "⏳ Max 8 ops/minute. Thodi der baad try karo.",
@@ -462,8 +473,8 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "sig_done":            "✅ *Signature extract ho gaya!*",
         "cancel":              "✋ Cancel ho gaya.",
         "error":               "❌ Kuch gadbad hui. /start karo.",
-        "unexpected":          "🤔 Samajh nahi aaya. Buttons use karo.",
-        "processing_lock":     "⚙️ Ek operation chal raha hai. Khatam hone do ya /cancel.",
+        "unexpected":          "🤔 Abhi is step pe ye kaam nahi hota. Upar diye steps follow karo.",
+        "processing_lock":     "⚙️ Ek operation chal raha hai. Khatam hone do ya /cancel karo.",
         "history":             "📤 Last processed image:",
         "no_history":          "📭 Koi previous image nahi.",
         "strict_on":           "✅ Strict ON — white padding, *no distortion*.",
@@ -482,10 +493,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "size_enter_kb":       "📦 *EXACT* target size batao (KB):\nExample: `100` ya `150kb` ya `0.5mb`\n\n💡 Size KAM ya ZYADA dono ho sakta hai — resolution same rahegi.",
         "size_fmt_choose":     "📁 Format chuno (JPEG recommended — exact size hit hota hai):",
         "size_done":           "🎯 *Size matched! Resolution SAME rakha.*",
-        "size_min_warn":       "⚠️ Itna chhota size is resolution pe possible nahi — best possible de diya. Aur chhota chahiye to resolution kam karni padegi (/resize).",
+        "size_min_warn":       "⚠️ Itna chhota size is resolution pe possible nahi — best possible de diya. Aur chhota chahiye to /resize use karo.",
         "size_max_warn":       "⚠️ Itna bada size possible nahi — max reached, best de diya.",
         "size_q_warn":         "ℹ️ Target ke liye compression thodi zyada lagi (q{q}).",
-        "size_info":           "📐 Resolution: `{w}×{h}` (UNCHANGED)\n📦 Size: `{size}` (target: `{target}`)\n🎚 JPEG quality: `q{q}`",
+        "size_info":           "📐 Resolution: `{w}×{h}` (UNCHANGED)\n📦 Size: `{size}` (target: `{target}`)\n🎚 Quality: `{q}`",
         "sheet_send_photo":    "📸 Photo bhejo — 4×6\" sheet pe *8 passport photos* (cut lines ke saath) ban jayegi:",
         "sheet_done":          "🖨 *Print sheet ready!*\n📄 4×6\" | 8 photos | Passport 35×45mm\n\n💡 Print shop ko JPEG do ya PDF print karo.",
         "privacy_notice": (
@@ -526,7 +537,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "looks_ok":            "✅ Looks good — proceed",
         "retry":               "🔁 Try again",
         "format_choose":       "📁 Choose output format:",
-        "dimensions":          "📐 Enter dimensions (any unit):\n• Pixels: `300x400`\n• Centimeters: `3.5x4.5cm`\n• Millimeters: `35x45mm`\n• Inches: `2x2in`",
+        "dimensions":          "📐 Enter dimensions (any format):\n• `300x400` or `300x400px`\n• `3.5x4.5cm` or `3.5cm x 4.5cm`\n• `35x45mm`\n• `2x2in`",
         "color_choose":        "🎨 Choose background color:",
         "custom_color_prompt": "🖊 Type a color name or hex:\nExamples: `white`, `blue`, `#E8F4FD`",
         "enter_kb":            "📦 Enter target size:\nExample: `100` (KB), `1.5mb`",
@@ -539,6 +550,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "face_small":          "⚠️ Face is small — a closer photo works better.",
         "face_offcenter":      "⚠️ Face is off-center — adjust framing.",
         "sig_bg_warn":         "⚠️ Background doesn't look white. Plain white paper is best.",
+        "sig_empty_warn":      "⚠️ No signature detected — the photo may be unclear or the ink too light. Try again with 🔁.",
         "bg_warning":          "ℹ️ AI result — please review the preview carefully.",
         "reminder":            "⚠️ Always verify before uploading.",
         "rate_limit":          "⏳ Max 8 ops/minute. Please wait.",
@@ -552,8 +564,8 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "sig_done":            "✅ *Signature extracted!*",
         "cancel":              "✋ Cancelled.",
         "error":               "❌ Something went wrong. /start again.",
-        "unexpected":          "🤔 Unexpected input. Use the buttons.",
-        "processing_lock":     "⚙️ An operation is running. Wait or /cancel.",
+        "unexpected":          "🤔 That doesn't work at this step. Follow the steps above.",
+        "processing_lock":     "⚙️ An operation is running. Wait for it or /cancel.",
         "history":             "📤 Last processed image:",
         "no_history":          "📭 No previous image found.",
         "strict_on":           "✅ Strict ON — white padding, *no distortion*.",
@@ -572,10 +584,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "size_enter_kb":       "📦 Enter the *EXACT* target size (KB):\nExample: `100` or `150kb` or `0.5mb`\n\n💡 Size can go DOWN or UP — resolution unchanged.",
         "size_fmt_choose":     "📁 Choose format (JPEG recommended — hits exact size):",
         "size_done":           "🎯 *Size matched! Resolution kept SAME.*",
-        "size_min_warn":       "⚠️ That size isn't reachable at this resolution — delivered the best possible. Use /resize if you can accept smaller dimensions.",
+        "size_min_warn":       "⚠️ That size isn't reachable at this resolution — delivered the best possible. Use /resize if smaller dimensions are OK.",
         "size_max_warn":       "⚠️ That size isn't reachable — delivered maximum possible.",
         "size_q_warn":         "ℹ️ Extra compression applied to hit target (q{q}).",
-        "size_info":           "📐 Resolution: `{w}×{h}` (UNCHANGED)\n📦 Size: `{size}` (target: `{target}`)\n🎚 JPEG quality: `q{q}`",
+        "size_info":           "📐 Resolution: `{w}×{h}` (UNCHANGED)\n📦 Size: `{size}` (target: `{target}`)\n🎚 Quality: `{q}`",
         "sheet_send_photo":    "📸 Send a photo — I'll make a 4×6\" sheet with *8 passport photos* (with cut lines):",
         "sheet_done":          "🖨 *Print sheet ready!*\n📄 4×6\" | 8 photos | Passport 35×45mm\n\n💡 Give the JPEG to any print shop, or print the PDF.",
         "privacy_notice": (
@@ -637,6 +649,8 @@ class S(Enum):
     SIZE_WAIT_KB         = 21
     SIZE_WAIT_FORMAT     = 22
 
+MENU_ACTION_PATTERN = r"^(bg_change|resize|signature|size_match|print_sheet)$"
+
 # ─────────────────────────────────────────────────────────────────────
 # RATE LIMITING + LOCK + TOKEN CLEANUP
 # ─────────────────────────────────────────────────────────────────────
@@ -671,7 +685,7 @@ def new_op_token(ctx) -> str:
     return tok
 
 def cleanup_session(ctx):
-    """Operation data wipe — history (hist_buf) JAAN-BOOJH KE preserve hoti hai."""
+    """Op data wipe — history (hist_buf) preserve hoti hai."""
     secure_wipe_all(ctx, _IMAGE_KEYS + ["target_kb", "_resize_mode"])
     ctx.user_data["_op"] = None
     release_lock(ctx)
@@ -679,9 +693,16 @@ def cleanup_session(ctx):
 async def schedule_cleanup(ctx, token: str, delay: int = SESSION_IDLE_SECS):
     await asyncio.sleep(delay)
     if ctx.user_data.get("_op") != token:
-        return                       # naya op shuru — stale task abort
+        return
     cleanup_session(ctx)
+    # v6.5: ghost prompt bhi delete karo — dead buttons kabhi na bachein
     chat_id = ctx.user_data.get("_chat_id")
+    mid = ctx.user_data.pop("svc_msg_id", None)
+    if chat_id and mid:
+        try:
+            await ctx.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
     if chat_id:
         try:
             await ctx.bot.send_message(chat_id, t("expired", ctx))
@@ -711,7 +732,6 @@ def ensure_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB") if img.mode != "RGB" else img
 
 def flatten_on_white(img: Image.Image) -> Image.Image:
-    """RGBA/LA → RGB over white. JPEG/PDF/preview ke liye (black-box killer)."""
     if img.mode in ("RGBA", "LA", "PA"):
         img = img.convert("RGBA")
         bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -726,12 +746,13 @@ def downscale_if_needed(img: Image.Image) -> Image.Image:
         img = img.resize((int(w * s), int(h * s)), Image.Resampling.LANCZOS)
     return img
 
-def detect_blur(img: Image.Image) -> float:
-    try:
-        gray = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
-        return cv2.Laplacian(gray, cv2.CV_64F).var()
-    except Exception:
-        return 999.0
+def _decode_image(data: bytes) -> Image.Image:
+    """v6.5: CPU-heavy decode/orient/downscale — thread se call hota hai."""
+    img = Image.open(io.BytesIO(data))
+    img = fix_orientation(img)
+    img = ensure_rgb(img)
+    img = downscale_if_needed(img)
+    return img
 
 @lru_cache(maxsize=1)
 def _haar_cascade():
@@ -755,7 +776,6 @@ def analyze_face(img: Image.Image) -> Optional[str]:
         return None
 
 def analyze_quality(img: Image.Image) -> Dict[str, Any]:
-    """Pre-flight report: blur / dark / overexposed / flat."""
     gray = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
     blur  = cv2.Laplacian(gray, cv2.CV_64F).var()
     bright = float(gray.mean())
@@ -782,30 +802,38 @@ def quality_feedback(img: Image.Image, ctx) -> str:
         return t("q_ok", ctx)
     return "\n".join(parts)
 
-def auto_enhance(img: Image.Image) -> Image.Image:
-    """
-    Studio-grade enhancement:
-    • Gray-world white balance (gentle, clipped 0.85–1.15)
-    • CLAHE on LAB L-channel (luminance only — colors intact)
-    • Subtle unsharp mask
-    """
+def _preflight(img: Image.Image, ctx, gentle: bool):
+    """Thread-runner: quality report + face warn + enhance — ek saath."""
+    fb = quality_feedback(img, ctx)
+    fw = analyze_face(img)
+    return fb, fw, auto_enhance(img, gentle=gentle)
+
+def auto_enhance(img: Image.Image, gentle: bool = False) -> Image.Image:
+    """gentle=True → BG flow (skin tone SAFE)."""
     arr = np.array(img.convert("RGB"))
+
     result = arr.astype(np.float32)
     avg = result.mean(axis=(0, 1))
-    gray_avg = avg.mean()
-    gains = np.clip(gray_avg / np.maximum(avg, 1), 0.85, 1.15)
-    result *= gains
+    deviation = np.abs(avg - avg.mean()) / max(avg.mean(), 1)
+    if deviation.max() > 0.08:
+        gains = np.clip(avg.mean() / np.maximum(avg, 1), 0.90, 1.10)
+        result *= gains
     arr = np.clip(result, 0, 255).astype(np.uint8)
 
+    clip = 1.3 if gentle else 1.8
     lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
-    l = clahe.apply(l)
+    l = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(l)
     arr = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2RGB)
 
-    blur  = cv2.GaussianBlur(arr, (0, 0), 1.2)
-    sharp = cv2.addWeighted(arr, 1.25, blur, -0.25, 0)
-    return Image.fromarray(sharp)
+    if gentle:
+        blur = cv2.GaussianBlur(arr, (0, 0), 1.0)
+        arr = cv2.addWeighted(arr, 1.12, blur, -0.12, 0)
+    else:
+        blur = cv2.GaussianBlur(arr, (0, 0), 1.2)
+        arr = cv2.addWeighted(arr, 1.25, blur, -0.25, 0)
+
+    return Image.fromarray(arr)
 
 def post_resize_sharpen(img: Image.Image) -> Image.Image:
     arr = np.array(img.convert("RGB"))
@@ -814,7 +842,6 @@ def post_resize_sharpen(img: Image.Image) -> Image.Image:
     return Image.fromarray(sharp)
 
 def create_preview(img: Image.Image) -> io.BytesIO:
-    """Alpha-safe: transparent areas WHITE — kabhi black nahi."""
     if img.mode in ("RGBA", "LA", "PA"):
         img = flatten_on_white(img)
     preview = img.copy()
@@ -832,23 +859,24 @@ def format_size(n: int) -> str:
     return f"{n / (1024 * 1024):.2f} MB"
 
 def parse_dimensions(text: str, dpi: int = DPI_DEFAULT) -> Optional[Tuple[int, int]]:
-    """mm/cm/in PEHLE, bare px LAST — warna '35x45mm' px ban jata!"""
+    """Trailing unit regex ko anchor karta hai — bare px kabhi mm/cm nahi banta.
+    '3.5x4.5cm' AUR '3.5cm x 4.5cm' dono chalte hain."""
     if not text:
         return None
     text = text.strip().lower()
-    m = re.match(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*mm", text)
+    m = re.match(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*x\s*(\d+(?:\.\d+)?)\s*mm", text)
     if m:
         px = lambda v: int(round(float(v) / 25.4 * dpi))
         return px(m.group(1)), px(m.group(2))
-    m = re.match(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*cm", text)
+    m = re.match(r"(\d+(?:\.\d+)?)\s*(?:cm)?\s*x\s*(\d+(?:\.\d+)?)\s*cm", text)
     if m:
         px = lambda v: int(round(float(v) / 2.54 * dpi))
         return px(m.group(1)), px(m.group(2))
-    m = re.match(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*in(?:ch)?", text)
+    m = re.match(r"(\d+(?:\.\d+)?)\s*(?:in)?\s*x\s*(\d+(?:\.\d+)?)\s*in(?:ch)?", text)
     if m:
         px = lambda v: int(round(float(v) * dpi))
         return px(m.group(1)), px(m.group(2))
-    m = re.match(r"(\d+)\s*x\s*(\d+)", text)
+    m = re.match(r"(\d+)\s*(?:px)?\s*x\s*(\d+)\s*(?:px)?", text)
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
@@ -884,7 +912,6 @@ def validate_color(text: str) -> bool:
         return False
 
 def smart_resize(img: Image.Image, w: int, h: int, pad_mode: bool) -> Image.Image:
-    """KABHI distort nahi. pad=white-gap fill | crop=center-crop fill."""
     if pad_mode:
         return ImageOps.pad(img, (w, h),
                             method=Image.Resampling.LANCZOS, color=(255, 255, 255))
@@ -903,16 +930,21 @@ def smart_resize(img: Image.Image, w: int, h: int, pad_mode: bool) -> Image.Imag
 def sanitize_md(text: str, maxlen: int = 60) -> str:
     return re.sub(r"[*_`\[\]]", "", text).strip()[:maxlen]
 
+def _content_ratio(img: Image.Image) -> float:
+    """Non-white pixel ratio (RGB images only)."""
+    g = np.asarray(img.convert("L"))
+    return float((g < 235).mean())
+
 # ─────────────────────────────────────────────────────────────────────
-# FACE-AWARE PASSPORT CROP 🎯 (govt-spec positioning)
+# FACE-AWARE PASSPORT CROP v6.5 — crop-in-source-coords
 # ─────────────────────────────────────────────────────────────────────
 def detect_face_mp(img: Image.Image) -> Optional[Dict[str, Any]]:
-    det_state = run_face_detect(np.array(img.convert("RGB")))
+    arr = np.array(img.convert("RGB"))
+    det_state = run_face_detect(arr)
     if not det_state or not det_state.detections:
         return None
     box = det_state.detections[0].location_data.relative_bounding_box
-    rgb = np.array(img.convert("RGB"))
-    ih, iw = rgb.shape[:2]
+    ih, iw = arr.shape[:2]
     return {
         "cx": (box.xmin + box.width / 2) * iw,
         "cy": (box.ymin + box.height / 2) * ih,
@@ -922,8 +954,13 @@ def detect_face_mp(img: Image.Image) -> Optional[Dict[str, Any]]:
 
 def passport_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     """
-    Govt-spec: face center 45% from top, face height = 70% of photo.
-    No face → smart center-crop fallback. Kabhi stretch nahi.
+    v6.5 REWRITE — crop window SOURCE coordinates mein compute hota hai:
+      s  = target_h*0.70 / face_h
+      window = (target_w/s × target_h/s) centered so face lands at
+               (50%, 45%) of output
+    Window ko source bounds se intersect karke sirf overlap piece
+    resize hota hai → NO giant intermediates (8192² bomb gone),
+    scale>2 cap hata — positioning AB BHI exact, kabhi distort nahi.
     """
     iw, ih = img.size
     try:
@@ -931,31 +968,35 @@ def passport_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image
     except Exception:
         face = None
 
-    if face and face["h"] > 0:
-        scale = (target_h * 0.70) / face["h"]
-        if scale > 2.0:
-            scale = 2.0                      # pixelation guard
-        new_w, new_h = max(1, int(iw * scale)), max(1, int(ih * scale))
-        img_r = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        fcx, fcy = face["cx"] * scale, face["cy"] * scale
-        x0 = int(fcx - target_w / 2)         # face horizontally centered
-        y0 = int(fcy - target_h * 0.45)      # face 45% from top
-        canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
-        sx0, sy0 = max(0, -x0), max(0, -y0)
-        dx0, dy0 = max(0, x0), max(0, y0)
-        avail_w = min(target_w - dx0, new_w - sx0)
-        avail_h = min(target_h - dy0, new_h - sy0)
-        if avail_w > 0 and avail_h > 0:
-            canvas.paste(img_r.crop((sx0, sy0, sx0 + avail_w, sy0 + avail_h)), (dx0, dy0))
-        return canvas
+    if not face or face["h"] <= 0:
+        return smart_resize(img, target_w, target_h, pad_mode=False)
 
-    return smart_resize(img, target_w, target_h, pad_mode=False)
+    s = (target_h * 0.70) / face["h"]
+    cw = target_w / s                    # window size in SOURCE px
+    ch = target_h / s
+    x0 = face["cx"] - cw / 2.0           # window origin — face → (50%, 45%)
+    y0 = face["cy"] - (target_h * 0.45) / s
+
+    # Intersection with source bounds
+    ix0, iy0 = max(0.0, x0), max(0.0, y0)
+    ix1, iy1 = min(float(iw), x0 + cw), min(float(ih), y0 + ch)
+
+    canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+    if ix1 > ix0 and iy1 > iy0:
+        crop = img.crop((int(ix0), int(iy0), int(ix1), int(iy1)))
+        dw = int(round((ix1 - ix0) * s))
+        dh = int(round((iy1 - iy0) * s))
+        if dw > 0 and dh > 0:
+            crop = crop.resize((dw, dh), Image.Resampling.LANCZOS)
+            dx = int(round((ix0 - x0) * s))   # white padding auto: shifted paste
+            dy = int(round((iy0 - y0) * s))
+            canvas.paste(crop, (dx, dy))
+    return canvas
 
 # ─────────────────────────────────────────────────────────────────────
-# CORE: BACKGROUND CHANGE — guided filter (halo killer)
+# CORE: BACKGROUND CHANGE v6.2 — trimap matting + decontamination
 # ─────────────────────────────────────────────────────────────────────
 def guided_filter(I: np.ndarray, p: np.ndarray, r: int = 8, eps: float = 1e-3) -> np.ndarray:
-    """He et al. edge-preserving filter — hair edges ke around NO halo."""
     I_f = I.astype(np.float32) / 255.0
     p_f = p.astype(np.float32)
     mean_I  = cv2.boxFilter(I_f, -1, (r, r))
@@ -971,59 +1012,84 @@ def guided_filter(I: np.ndarray, p: np.ndarray, r: int = 8, eps: float = 1e-3) -
     return (mean_a * I_f + mean_b).clip(0, 1)
 
 def person_segmentation_replace(img: Image.Image, color_text: str) -> Image.Image:
+    """
+    MATTING-GRADE: guided refine → trimap (hair survives) →
+    decontamination (no halo) → smooth → continuous composite.
+    """
+    if max(img.size) > BG_MAX_DIM:
+        s = BG_MAX_DIM / max(img.size)
+        img = img.resize((int(img.width * s), int(img.height * s)),
+                         Image.Resampling.LANCZOS)
+
     rgb_arr = np.array(img.convert("RGB"))
     h, w = rgb_arr.shape[:2]
+    img_f = rgb_arr.astype(np.float32)
 
     result = run_segmentation(rgb_arr)
     mask_f = result.segmentation_mask.astype(np.float32)
-
-    # Guided filter refinement — hair/fine-detail edges
     gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
     r = max(4, min(h, w) // 100)
-    mask_refined = np.clip(guided_filter(gray, mask_f, r=r, eps=1e-4), 0, 1)
+    mask_ref = np.clip(guided_filter(gray, mask_f, r=r, eps=1e-4), 0, 1)
+    del result, mask_f, gray
+    gc.collect()
 
-    # Confidence sharpening
-    mask_sharp = np.where(mask_refined > 0.5,
-                          np.clip(mask_refined * 1.4, 0, 1),
-                          np.clip(mask_refined * 0.6, 0, 1))
-
-    # Morphological cleanup (binary core only)
-    mask_bin = (mask_sharp > 0.5).astype(np.uint8)
-    k = max(5, int(min(h, w) / 150)); k += (k + 1) % 2
+    core = (mask_ref > 0.75).astype(np.uint8)
+    k = max(3, int(min(h, w) / 250)); k += (k + 1) % 2
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, kernel)
-    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, kernel)
+    sure_bg = mask_ref < 0.12
 
-    # Soft transition zone preserves refined confidence
-    mask_final = np.where((mask_sharp > 0.3) & (mask_sharp < 0.7),
-                          mask_sharp, mask_bin.astype(np.float32))
-    feather = min(21, max(5, k // 2)); feather += (feather + 1) % 2
-    mask_final = cv2.GaussianBlur(mask_final, (feather, feather), 0)
-    mask_final = np.clip(mask_final, 0, 1)[..., np.newaxis]
+    alpha = np.where(core > 0, 1.0,
+            np.where(sure_bg, 0.0, mask_ref)).astype(np.float32)
+    del core, sure_bg, mask_ref
+    gc.collect()
 
-    color  = parse_color(color_text)
-    bg_arr = np.full_like(rgb_arr, color, dtype=np.uint8)
-    out = (rgb_arr.astype(np.float32) * mask_final +
-           bg_arr.astype(np.float32) * (1 - mask_final)).astype(np.uint8)
-    out[mask_final[..., 0] < 0.05] = color       # pure-bg hard snap
+    alpha = np.power(alpha, 0.85)
+    alpha = cv2.medianBlur(alpha, 3)
+    alpha = cv2.GaussianBlur(alpha, (5, 5), 0)
 
+    # 🌟 Decontamination — edge pixels se purana bg un-mix
+    border = np.concatenate([
+        img_f[:12].reshape(-1, 3),  img_f[-12:].reshape(-1, 3),
+        img_f[:, :12].reshape(-1, 3), img_f[:, -12:].reshape(-1, 3)])
+    bg_orig = np.median(border, axis=0)
+
+    a3 = alpha[..., None]
+    semi = (a3 > 0.25) & (a3 < 0.98)
+    if np.any(semi):
+        a_safe = np.maximum(a3, 0.25)
+        fg_est = (img_f - (1.0 - a3) * bg_orig) / a_safe
+        img_f[semi[..., 0]] = fg_est[semi[..., 0]]
+        del fg_est
+    del semi, a3
+    gc.collect()
+
+    color = parse_color(color_text)
+    a3 = alpha[..., None]
+    out = img_f * a3 + np.float32(color) * (1.0 - a3)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+
+    del img_f, alpha, a3
+    gc.collect()
     return Image.fromarray(out)
 
 # ─────────────────────────────────────────────────────────────────────
-# CORE: SIGNATURE v2 — hysteresis + smooth alpha (NO broken strokes)
+# CORE: SIGNATURE v2.1 — auto-downscale + hysteresis + smooth alpha
 # ─────────────────────────────────────────────────────────────────────
 def extract_signature(img: Image.Image) -> Image.Image:
-    rgb  = np.array(img.convert("RGB"))
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    # v6.5: bade scans pe bilateral filter bahut slow — 2000px kaafi hai
+    if max(img.size) > SIG_MAX_DIM:
+        s = SIG_MAX_DIM / max(img.size)
+        img = img.resize((int(img.width * s), int(img.height * s)),
+                         Image.Resampling.LANCZOS)
 
-    # Bilateral denoise — strokes safe, noise gone
+    gray = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+
     gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
 
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     gray  = clahe.apply(gray)
 
-    # HYSTERESIS: strong = definite ink, weak = kept only if connected to strong
     strong = (gray < 140).astype(np.uint8) * 255
     weak   = (gray < 190).astype(np.uint8) * 255
 
@@ -1034,7 +1100,6 @@ def extract_signature(img: Image.Image) -> Image.Image:
         if np.any(comp & (strong > 0)):
             result_mask[comp] = 255
 
-    # Small-blob cleanup (paper texture)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(result_mask, 8)
     min_area = max(8, int(result_mask.size * 0.00003))
     clean = np.zeros_like(result_mask)
@@ -1042,17 +1107,14 @@ def extract_signature(img: Image.Image) -> Image.Image:
         if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
             clean[labels == lbl] = 255
 
-    # Micro-gap sealing
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, k, iterations=1)
 
-    # SMOOTH ALPHA — distance transform = anti-aliased strokes
     dist = cv2.distanceTransform((clean > 0).astype(np.uint8), cv2.DIST_L2, 3)
     alpha = np.clip(dist * 3.0, 0, 1)
     alpha[clean > 0] = np.maximum(alpha[clean > 0], 0.7)
     alpha = (alpha * 255).astype(np.uint8)
 
-    # Auto-crop with padding
     coords = cv2.findNonZero((alpha > 0).astype(np.uint8))
     if coords is not None:
         x, y, bw, bh = cv2.boundingRect(coords)
@@ -1061,9 +1123,15 @@ def extract_signature(img: Image.Image) -> Image.Image:
                       max(0, x - px):min(alpha.shape[1], x + bw + px)]
 
     out = np.zeros((alpha.shape[0], alpha.shape[1], 4), dtype=np.uint8)
-    out[..., 0] = 10; out[..., 1] = 10; out[..., 2] = 12   # soft near-black ink
+    out[..., 0] = 10; out[..., 1] = 10; out[..., 2] = 12
     out[..., 3] = alpha
     return Image.fromarray(out, "RGBA")
+
+def _sig_bg_is_white(img: Image.Image) -> bool:
+    """Thread-runner — corner brightness check."""
+    arr = np.array(img.convert("RGB"))
+    corners = [arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]]
+    return all(v > 190 for v in np.mean(corners, axis=0))
 
 # ─────────────────────────────────────────────────────────────────────
 # CORE: COMPRESS (reduce flow — dimension fallback allowed)
@@ -1089,7 +1157,6 @@ def compress_to_kb(img: Image.Image, target_kb: int, fmt: str = "JPEG") -> io.By
                                max(1, int(img.height * scale))), Image.Resampling.LANCZOS)
         buf.seek(0); return buf
 
-    # JPEG — binary search on quality
     src = flatten_on_white(img)
     lo, hi = MIN_QUALITY, MAX_QUALITY
     best = None
@@ -1106,7 +1173,6 @@ def compress_to_kb(img: Image.Image, target_kb: int, fmt: str = "JPEG") -> io.By
         buf.seek(0); buf.truncate(); buf.write(best); buf.seek(0)
         return buf
 
-    # Dimension fallback (reduce flow mein resolution change allowed hai)
     lo_s, hi_s = 0.1, 0.9
     while hi_s - lo_s > 0.02:
         mid_s = (lo_s + hi_s) / 2
@@ -1125,16 +1191,12 @@ def compress_to_kb(img: Image.Image, target_kb: int, fmt: str = "JPEG") -> io.By
 
 # ─────────────────────────────────────────────────────────────────────
 # 🎯 CORE: EXACT SIZE MATCH — same resolution GUARANTEED
-#
-# Down: JPEG quality binary search (resolution untouched)
-# Up:   max quality + FINE GRAIN NOISE injection (invisible, adds entropy)
-#       → yahi trick photo studios use karte hain size badhane ke liye
 # ─────────────────────────────────────────────────────────────────────
 def _jpeg_encode(src: Image.Image, q: int) -> bytes:
     b = io.BytesIO()
     kw = dict(format="JPEG", quality=q, optimize=True)
     if q >= 90:
-        kw["subsampling"] = 0          # 4:4:4 chroma — high quality pe better
+        kw["subsampling"] = 0
     src.save(b, **kw)
     return b.getvalue()
 
@@ -1144,9 +1206,9 @@ def match_file_size_kb(img: Image.Image, target_kb: int,
     src = flatten_on_white(img)
 
     if fmt.upper() == "PNG":
-        # PNG exact hit tough — level sweep → quantization sweep (best effort)
+        # v6.4 FIX retained: level 0→9 — pehla fit = target ke SABSE KAREEB
         best_data, warn, reduced = None, None, False
-        for lvl in range(9, 0, -1):
+        for lvl in range(0, 10):
             b = io.BytesIO()
             src.save(b, format="PNG", compress_level=lvl)
             if b.tell() <= target:
@@ -1165,31 +1227,30 @@ def match_file_size_kb(img: Image.Image, target_kb: int,
         return io.BytesIO(best_data), {"warn": warn,
                                        "quality": "colors-reduced" if reduced else "lossless"}
 
-    # ── JPEG Phase A: quality binary search ──
-    best_data, best_q = None, None
+    # JPEG Phase A: quality binary search
+    best_data = None
     lo, hi = MIN_QUALITY, MAX_QUALITY
     while lo <= hi:
         mid = (lo + hi) // 2
         data = _jpeg_encode(src, mid)
         sz = len(data)
-        if abs(sz - target) <= target * 0.02:                  # ±2% = instant win
+        if abs(sz - target) <= target * 0.02:
             warn = None if mid >= 30 else "quality"
             return io.BytesIO(data), {"quality": mid, "warn": warn}
         if sz < target:
-            best_data, best_q = data, mid
+            best_data = data
             lo = mid + 1
         else:
             hi = mid - 1
 
     if best_data is None:
-        # MIN_QUALITY pe bhi bada hai — resolution NAHI badlenge (user ka rule)
         data = _jpeg_encode(src, MIN_QUALITY)
         return io.BytesIO(data), {"quality": MIN_QUALITY, "warn": "min"}
 
-    # ── JPEG Phase B: SIZE BADHANA → grain noise (≤4MP memory-safe) ──
+    # JPEG Phase B: size badhana → grain noise (≤4MP)
     best_up = None
     if src.width * src.height <= NOISE_MAX_PIXELS:
-        rng = np.random.default_rng(42)                        # deterministic
+        rng = np.random.default_rng(42)
         noise1 = rng.standard_normal((src.height, src.width, 3)).astype(np.float32)
         arr0 = np.array(src).astype(np.float32)
         lo_s, hi_s = 0.3, 10.0
@@ -1211,17 +1272,22 @@ def match_file_size_kb(img: Image.Image, target_kb: int,
                                                         "warn": "max"}
 
 # ─────────────────────────────────────────────────────────────────────
-# 🖨 CORE: PRINT SHEET — 8 passport photos on 4×6" landscape
+# 🖨 CORE: PRINT SHEET + empty-sheet guard
 # ─────────────────────────────────────────────────────────────────────
 def make_photo_sheet(img: Image.Image, dpi: int = 300,
                      cols: int = 4, rows: int = 2,
                      gap_mm: float = 2.0) -> Image.Image:
-    cw, ch = int(6.0 * dpi), int(4.0 * dpi)          # landscape
+    cw, ch = int(6.0 * dpi), int(4.0 * dpi)
     gap = int(gap_mm / 25.4 * dpi)
     cell_w = (cw - (cols + 1) * gap) // cols
     cell_h = (ch - (rows + 1) * gap) // rows
 
-    photo = passport_crop(img, cell_w, cell_h)        # face-aware crop per cell
+    photo = passport_crop(img, cell_w, cell_h)
+
+    # 🛡️ 90%+ white = crop fail → center-crop fallback
+    if _content_ratio(photo) < 0.10:
+        logger.warning("passport_crop near-empty canvas — center-crop fallback")
+        photo = smart_resize(img, cell_w, cell_h, pad_mode=False)
 
     sheet = Image.new("RGB", (cw, ch), (255, 255, 255))
     d = ImageDraw.Draw(sheet)
@@ -1231,8 +1297,15 @@ def make_photo_sheet(img: Image.Image, dpi: int = 300,
             y = gap + r_i * (cell_h + gap)
             sheet.paste(photo, (x, y))
             d.rectangle([x, y, x + cell_w, y + cell_h],
-                        outline=(185, 185, 185), width=1)   # cut lines
+                        outline=(185, 185, 185), width=1)
     return sheet
+
+def _sheet_encode(sheet: Image.Image) -> Tuple[bytes, bytes]:
+    jb = io.BytesIO()
+    sheet.save(jb, format="JPEG", quality=MAX_QUALITY, dpi=(300, 300), optimize=True)
+    pb = io.BytesIO()
+    sheet.save(pb, format="PDF", resolution=300)
+    return jb.getvalue(), pb.getvalue()
 
 # ─────────────────────────────────────────────────────────────────────
 # SAVE / VALIDATE
@@ -1266,23 +1339,42 @@ async def safe_reply(update: Update, text: str, reply_markup=None, parse_mode="M
     if target:
         await target.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
-async def safe_edit(update: Update, text: str, reply_markup=None):
-    if not update.callback_query:
-        return
-    q = update.callback_query
-    try:
-        if q.message.text is not None:
-            await q.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-        elif q.message.caption is not None:
-            await q.edit_message_caption(text, reply_markup=reply_markup, parse_mode="Markdown")
-        else:
-            await q.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            await q.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+# ─────────────────────────────────────────────────────────────────────
+# SERVICE-MESSAGE MANAGER — ek hi interactive message, ghost impossible
+# ─────────────────────────────────────────────────────────────────────
+async def _svc_delete(ctx, chat_id: int):
+    mid = ctx.user_data.pop("svc_msg_id", None)
+    if mid:
+        try:
+            await ctx.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+async def svc_prompt(update: Update, ctx, text: str,
+                     reply_markup=None, parse_mode="Markdown"):
+    chat_id = update.effective_chat.id
+    await _svc_delete(ctx, chat_id)
+    msg = await ctx.bot.send_message(chat_id, text,
+                                     reply_markup=reply_markup,
+                                     parse_mode=parse_mode)
+    ctx.user_data["svc_msg_id"] = msg.message_id
+    return msg
+
+async def svc_prompt_photo(update: Update, ctx, photo, caption: str,
+                           reply_markup=None):
+    chat_id = update.effective_chat.id
+    await _svc_delete(ctx, chat_id)
+    msg = await ctx.bot.send_photo(chat_id, photo=photo, caption=caption,
+                                   reply_markup=reply_markup,
+                                   parse_mode="Markdown")
+    ctx.user_data["svc_msg_id"] = msg.message_id
+    return msg
+
+async def send_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await svc_prompt(update, ctx, t("main_menu", ctx), main_menu_kb(ctx))
 
 async def get_image(update: Update):
-    """PIL Image | 'too_large' | 'invalid' | None — callers teeno handle karte hain."""
+    """PIL Image | 'too_large' | 'invalid' | None. Decode thread mein (v6.5)."""
     msg = update.message
     fobj = (msg.photo[-1] if msg.photo else None) or msg.document
     if not fobj:
@@ -1296,22 +1388,16 @@ async def get_image(update: Update):
     data = raw.read()
     if not validate_image_bytes(data):
         return "invalid"
-    img = Image.open(io.BytesIO(data))
-    img = downscale_if_needed(fix_orientation(ensure_rgb(img)))
+    try:
+        img = await asyncio.to_thread(_decode_image, data)
+    except Exception:
+        return "invalid"
     return img
-
-async def send_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = main_menu_kb(ctx)
-    if update.callback_query:
-        await safe_edit(update, t("main_menu", ctx), kb)
-    else:
-        await safe_reply(update, t("main_menu", ctx), kb)
 
 def log_state(uid: int, state: str, action: str):
     logger.info(f"STATE={state} | {action}")
 
 def _store_history(ctx, data: bytes, filename: str):
-    """Nayi result store karo — purani wipe (RAM hygiene)."""
     old = ctx.user_data.pop("hist_buf", None)
     if isinstance(old, SecureBuffer):
         old.wipe()
@@ -1375,8 +1461,11 @@ def resize_mode_kb(ctx) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📐 Custom Dimensions", callback_data="resize_custom")],
         [InlineKeyboardButton("📦 Reduce File Size",  callback_data="resize_reduce")]])
 
-def preset_kb() -> InlineKeyboardMarkup:
-    presets = db_get_presets()[:40]
+async def preset_kb() -> InlineKeyboardMarkup:
+    presets = (await asyncio.to_thread(db_get_presets))[:40]
+    if not presets:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("📐 Custom Dimensions", callback_data="preset_custom")]])
     rows, i = [], 0
     while i < len(presets):
         rows.append([InlineKeyboardButton(p["label"], callback_data=f"preset_{p['id']}")
@@ -1399,13 +1488,17 @@ def sig_format_kb() -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────────────────────────────
 # COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def _ensure_user(update: Update, ctx):
+    """v6.5 FIX: pehli baar aaye user ka DB row TURANT banta hai
+    (pehle sirf 2nd /start pe banta tha — stats corrupt ho rahe the)."""
     uid = update.effective_user.id
     _known_real_ids.add(uid)
     if "hinglish" not in ctx.user_data:
         ctx.user_data.update(await asyncio.to_thread(get_user_prefs, uid))
-    else:
         await asyncio.to_thread(upsert_user, uid)
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await _ensure_user(update, ctx)
     cleanup_session(ctx)
     await send_main_menu(update, ctx)
     return S.SELECT_ACTION
@@ -1419,12 +1512,14 @@ async def cmd_privacy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_hinglish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     curr = ctx.user_data.get("hinglish", False)
     ctx.user_data["hinglish"] = not curr
+    await _ensure_user(update, ctx)
     await asyncio.to_thread(save_user_pref, update.effective_user.id, "hinglish", int(not curr))
     await safe_reply(update, t("lang_hi" if not curr else "lang_en", ctx))
 
 async def cmd_strict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     curr = ctx.user_data.get("strict", True)
     ctx.user_data["strict"] = not curr
+    await _ensure_user(update, ctx)
     await asyncio.to_thread(save_user_pref, update.effective_user.id, "strict", int(not curr))
     await safe_reply(update, t("strict_on" if not curr else "strict_off", ctx))
 
@@ -1432,6 +1527,7 @@ async def cmd_dpi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.args and ctx.args[0].isdigit() and int(ctx.args[0]) in ALLOWED_DPIS:
         v = int(ctx.args[0])
         ctx.user_data["dpi"] = v
+        await _ensure_user(update, ctx)
         await asyncio.to_thread(save_user_pref, update.effective_user.id, "dpi", v)
         await safe_reply(update, t("dpi_set", ctx) + f"`{v}`")
     else:
@@ -1441,18 +1537,17 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = secure_peek(ctx, "hist_buf")
     if not data:
         await safe_reply(update, t("no_history", ctx))
-        return ConversationHandler.END
+        return
     name = ctx.user_data.get("hist_name", "output.jpg")
     target = update.message or update.callback_query.message
     await target.reply_document(document=io.BytesIO(data), filename=name,
                                 caption=t("history", ctx))
-    return ConversationHandler.END
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     cleanup_session(ctx)
     await safe_reply(update, t("cancel", ctx))
     await send_main_menu(update, ctx)
-    return ConversationHandler.END
+    return S.SELECT_ACTION
 
 async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     hid = hash_uid(update.effective_user.id)
@@ -1475,13 +1570,14 @@ async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await safe_reply(update, "❌ Access denied."); return
-    stats = get_bot_stats()
+    stats = await asyncio.to_thread(get_bot_stats)
     up = int(time.time() - BOT_START_TIME)
     heic = "✅" if HEIC_OK else "❌ pip install pillow-heif"
     mp_s = "✅" if MP_OK else "❌ pip install mediapipe"
+    ws = "waitress ✓" if WAITRESS_OK else "flask-dev"
     await safe_reply(update,
         f"🛠 *Admin Panel — {VERSION}*\n\n"
-        f"Uptime: `{up//3600}h {(up%3600)//60}m`\n"
+        f"Uptime: `{up//3600}h {(up%3600)//60}m` | 🌐 {ws}\n"
         f"👥 Users: `{stats['total_users']}` | 📊 Ops: `{stats['total_ops']}`\n"
         f"🧠 MediaPipe: {mp_s} | 📱 HEIC: {heic}\n\n"
         f"_No personal data stored. Real IDs hashed._")
@@ -1519,7 +1615,7 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_listpresets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await safe_reply(update, "❌ Access denied."); return
-    presets = db_list_all_presets()
+    presets = await asyncio.to_thread(db_list_all_presets)
     if not presets:
         await safe_reply(update, "📋 No presets yet."); return
     lines = ["📋 *All Presets*\n"]
@@ -1544,7 +1640,7 @@ async def cmd_addpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await safe_reply(update, "❌ Width/height must be numbers (16–5000 px)."); return
-    new_id = db_add_preset(label, w, h)
+    new_id = await asyncio.to_thread(db_add_preset, label, w, h)
     await safe_reply(update, f"✅ *Preset added!*\n`ID:{new_id}` — {label} — `{w}×{h}px`")
 
 async def cmd_editpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1560,12 +1656,12 @@ async def cmd_editpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await safe_reply(update, "❌ Invalid values."); return
-    preset = db_get_preset_by_id(pid)
+    preset = await asyncio.to_thread(db_get_preset_by_id, pid)
     if not preset:
         await safe_reply(update, f"❌ ID `{pid}` not found."); return
     label = sanitize_md(parts[1], 40)
-    db_edit_preset(pid, label, w, h)
-    await safe_reply(update, f"✅ Updated!\n{preset['label']} → {label} `{w}×{h}px`")
+    await asyncio.to_thread(db_edit_preset, pid, label, w, h)
+    await safe_reply(update, f"✅ Updated!\n{sanitize_md(preset['label'])} → {label} `{w}×{h}px`")
 
 async def cmd_delpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -1573,52 +1669,53 @@ async def cmd_delpreset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or not ctx.args[0].isdigit():
         await safe_reply(update, "📝 *Format:* `/delpreset ID`"); return
     pid = int(ctx.args[0])
-    preset = db_get_preset_by_id(pid)
+    preset = await asyncio.to_thread(db_get_preset_by_id, pid)
     if not preset:
         await safe_reply(update, f"❌ ID `{pid}` not found."); return
-    db_delete_preset(pid)
+    await asyncio.to_thread(db_delete_preset, pid)
     await safe_reply(update, f"🗑 Deleted: {sanitize_md(preset['label'])}")
 
 # ─────────────────────────────────────────────────────────────────────
-# MAIN FLOW: SELECT
+# MAIN FLOW: SELECT — lock-fail/rate-limit pe return None = STATE PRESERVED
 # ─────────────────────────────────────────────────────────────────────
-async def select_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def select_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     q = update.callback_query
-    await q.answer()
     uid = update.effective_user.id
-    _known_real_ids.add(uid)
+    log_state(uid, "SELECT_ACTION", q.data)
+    await _ensure_user(update, ctx)
+
+    # Lock held → koi bhi menu action alert-only, chalu operation untouched
+    if ctx.user_data.get("_lock"):
+        await q.answer(t("processing_lock", ctx), show_alert=True)
+        return None
+
     if not check_rate_limit(uid):
-        await safe_edit(update, t("rate_limit", ctx)); return ConversationHandler.END
-    data = q.data
-    log_state(uid, "SELECT_ACTION", data)
-    if data == "bg_change":
-        if not acquire_lock(ctx):
-            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
-        _start_op(update, ctx)
-        await safe_edit(update, t("send_photo", ctx))
-        return S.BG_WAIT_PHOTO
-    elif data == "resize":
-        await safe_edit(update, t("resize", ctx), resize_mode_kb(ctx))
+        await q.answer(t("rate_limit", ctx), show_alert=True)
+        return None
+
+    if q.data == "resize":
+        await q.answer()
+        await svc_prompt(update, ctx, t("resize", ctx), resize_mode_kb(ctx))
         return S.RESIZE_MODE
-    elif data == "signature":
+
+    op_map = {
+        "bg_change":   ("send_photo",       S.BG_WAIT_PHOTO),
+        "signature":   ("send_photo",       S.SIG_WAIT_PHOTO),
+        "size_match":  ("size_send_photo",  S.SIZE_WAIT_PHOTO),
+        "print_sheet": ("sheet_send_photo", S.SHEET_WAIT_PHOTO),
+    }
+    if q.data in op_map:
         if not acquire_lock(ctx):
-            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
+            await q.answer(t("processing_lock", ctx), show_alert=True)
+            return None
+        await q.answer()
         _start_op(update, ctx)
-        await safe_edit(update, t("send_photo", ctx))
-        return S.SIG_WAIT_PHOTO
-    elif data == "size_match":
-        if not acquire_lock(ctx):
-            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
-        _start_op(update, ctx)
-        await safe_edit(update, t("size_send_photo", ctx))
-        return S.SIZE_WAIT_PHOTO
-    elif data == "print_sheet":
-        if not acquire_lock(ctx):
-            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
-        _start_op(update, ctx)
-        await safe_edit(update, t("sheet_send_photo", ctx))
-        return S.SHEET_WAIT_PHOTO
-    return S.SELECT_ACTION
+        prompt_key, next_state = op_map[q.data]
+        await svc_prompt(update, ctx, t(prompt_key, ctx))
+        return next_state
+
+    await q.answer()
+    return None
 
 # ─────────────────────────────────────────────────────────────────────
 # BACKGROUND CHANGE FLOW
@@ -1627,19 +1724,20 @@ async def bg_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     _known_real_ids.add(uid)
     if not check_rate_limit(uid):
-        await safe_reply(update, t("rate_limit", ctx)); return ConversationHandler.END
+        await safe_reply(update, t("rate_limit", ctx)); return S.BG_WAIT_PHOTO
     img = await get_image(update)
     if img == "too_large":
         await safe_reply(update, t("file_too_large", ctx)); return S.BG_WAIT_PHOTO
     if img in ("invalid", None):
         await safe_reply(update, t("invalid_file" if img == "invalid" else "no_photo", ctx))
         return S.BG_WAIT_PHOTO
-    await safe_reply(update, quality_feedback(img, ctx))
-    if (fw := analyze_face(img)):
+    fb, fw, img = await asyncio.to_thread(_preflight, img, ctx, True)
+    await safe_reply(update, fb)
+    if fw:
         await safe_reply(update, t(fw, ctx))
-    img = auto_enhance(img)
-    secure_store(ctx, "bg_img", img)
-    await safe_reply(update, t("color_choose", ctx), bg_color_kb())
+    await a_secure_store(ctx, "bg_img", img)
+    img = None; gc.collect()
+    await svc_prompt(update, ctx, t("color_choose", ctx), bg_color_kb())
     return S.BG_WAIT_COLOR
 
 async def bg_wait_color(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1648,60 +1746,67 @@ async def bg_wait_color(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.callback_query.answer()
         data = update.callback_query.data
         if data == "col_custom":
-            await safe_edit(update, t("custom_color_prompt", ctx)); return S.BG_WAIT_COLOR
+            await svc_prompt(update, ctx, t("custom_color_prompt", ctx))
+            return S.BG_WAIT_COLOR
         if data.startswith("col_"):
             color_text = data[4:]
     elif update.message:
         raw = (update.message.text or "").strip()
         if not raw:
-            await safe_reply(update, t("unexpected", ctx)); return S.BG_WAIT_COLOR
+            return S.BG_WAIT_COLOR
         if not validate_color(raw):
-            await safe_reply(update, f"❌ `{sanitize_md(raw, 30)}` invalid. Try: `white`, `#FF0000`")
+            # error + keyboard dono — buttons kabhi khoye nahi
+            await svc_prompt(update, ctx,
+                f"❌ `{sanitize_md(raw, 30)}` invalid. Try: `white`, `#FF0000`",
+                bg_color_kb())
             return S.BG_WAIT_COLOR
         color_text = raw
     if not color_text:
         return S.BG_WAIT_COLOR
 
-    img = secure_load(ctx, "bg_img")
+    img = await a_secure_load(ctx, "bg_img")
     if not img:
-        await safe_reply(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
 
-    target = update.message or update.callback_query.message
-    proc = await target.reply_text(t("processing", ctx))
+    proc = await svc_prompt(update, ctx, t("processing", ctx))
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(person_segmentation_replace, img, color_text),
             timeout=PROCESSING_TIMEOUT)
-        del img; gc.collect()
-        secure_store(ctx, "bg_result", result)
+        img = None; gc.collect()
+        await a_secure_store(ctx, "bg_result", result)
+        result = None; gc.collect()
     except RuntimeError:
-        del img; gc.collect()
+        img = None; gc.collect()
         await proc.edit_text(t("ai_unavailable", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     except asyncio.TimeoutError:
-        del img; gc.collect()
+        img = None; gc.collect()
         await proc.edit_text(t("timeout_err", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     except Exception as e:
-        del img; gc.collect()
+        img = None; gc.collect()
         logger.error(f"bg_wait_color: {e}", exc_info=True)
         await proc.edit_text(t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
-    await proc.delete()
+        return S.SELECT_ACTION
 
-    res = secure_load(ctx, "bg_result")
-    preview = create_preview(res)
-    secure_store(ctx, "bg_result", res)
-    del res; gc.collect()
+    res = await a_secure_load(ctx, "bg_result")
+    if not res:
+        await svc_prompt(update, ctx, t("error", ctx))
+        cleanup_session(ctx); await send_main_menu(update, ctx)
+        return S.SELECT_ACTION
+    preview = await asyncio.to_thread(create_preview, res)
+    await a_secure_store(ctx, "bg_result", res)
+    res = None; gc.collect()
 
-    await target.reply_photo(photo=preview,
-        caption=f"{t('preview', ctx)}\n\n{t('bg_warning', ctx)}",
-        reply_markup=confirm_kb("bg_ok", "bg_retry", ctx), parse_mode="Markdown")
+    await svc_prompt_photo(update, ctx, preview,
+                           f"{t('preview', ctx)}\n\n{t('bg_warning', ctx)}",
+                           confirm_kb("bg_ok", "bg_retry", ctx))
     return S.BG_PREVIEW
 
 async def bg_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1711,84 +1816,97 @@ async def bg_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await q.edit_message_caption(caption=t("format_choose", ctx),
                                          reply_markup=format_kb(), parse_mode="Markdown")
         except BadRequest:
-            await q.message.reply_text(t("format_choose", ctx), reply_markup=format_kb())
+            await svc_prompt(update, ctx, t("format_choose", ctx), format_kb())
         return S.BG_WAIT_FORMAT
     elif q.data == "bg_retry":
         secure_wipe_all(ctx, ["bg_result"])
-        try: await q.message.delete()
-        except Exception: pass
-        await ctx.bot.send_message(q.message.chat_id, t("send_photo", ctx))
+        await svc_prompt(update, ctx, t("send_photo", ctx))
         return S.BG_WAIT_PHOTO
     return S.BG_PREVIEW
 
 async def bg_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     fmt = q.data.replace("fmt_", "")
-    result = secure_load(ctx, "bg_result")
+    result = await a_secure_load(ctx, "bg_result")
     if not result:
-        await safe_edit(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     dims = result.size
     try:
         buf = await asyncio.to_thread(save_image, result, fmt,
                                       ctx.user_data.get("dpi", DPI_DEFAULT))
         data = buf.getvalue(); buf.close()
+        result = None; gc.collect()
         await deliver_result(update, ctx, q.message, data,
                              f"output.{fmt.lower()}", dims, "bg_done")
-        del result; gc.collect()
+        data = None; gc.collect()
     except Exception as e:
+        result = None; gc.collect()
         logger.error(f"bg_wait_format: {e}", exc_info=True)
-        await safe_edit(update, t("error", ctx))
+        await safe_reply(update, t("error", ctx))
     finally:
         cleanup_session(ctx)
         await send_main_menu(update, ctx)
-    return ConversationHandler.END
+    return S.SELECT_ACTION
 
 # ─────────────────────────────────────────────────────────────────────
-# RESIZE FLOW (face-aware presets!)
+# RESIZE FLOW
 # ─────────────────────────────────────────────────────────────────────
-async def resize_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; await q.answer()
+async def resize_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    q = update.callback_query
+    # 🌟 v6.5 FIX: lock check PEHLE, answer BAAD MEIN — double-answer
+    # BadRequest kabhi nahi hoga, alert user ko actually dikhega
     if q.data in ("resize_preset", "resize_custom"):
         if not acquire_lock(ctx):
-            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
+            await q.answer(t("processing_lock", ctx), show_alert=True)
+            return None
+        await q.answer()
         ctx.user_data["_resize_mode"] = "preset" if q.data == "resize_preset" else "custom"
         _start_op(update, ctx)
-        await safe_edit(update, t("send_photo", ctx))
+        await svc_prompt(update, ctx, t("send_photo", ctx))
         return S.CUSTOM_WAIT_PHOTO
-    elif q.data == "resize_reduce":
+    if q.data == "resize_reduce":
         if not acquire_lock(ctx):
-            await safe_edit(update, t("processing_lock", ctx)); return ConversationHandler.END
+            await q.answer(t("processing_lock", ctx), show_alert=True)
+            return None
+        await q.answer()
         _start_op(update, ctx)
-        await safe_edit(update, t("reduce_send_photo", ctx))
+        await svc_prompt(update, ctx, t("reduce_send_photo", ctx))
         return S.REDUCE_WAIT_PHOTO
+    await q.answer()
     return S.RESIZE_MODE
 
 async def custom_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     _known_real_ids.add(uid)
+    if not check_rate_limit(uid):
+        await safe_reply(update, t("rate_limit", ctx)); return S.CUSTOM_WAIT_PHOTO
     img = await get_image(update)
     if img == "too_large":
         await safe_reply(update, t("file_too_large", ctx)); return S.CUSTOM_WAIT_PHOTO
     if img in ("invalid", None):
         await safe_reply(update, t("invalid_file" if img == "invalid" else "no_photo", ctx))
         return S.CUSTOM_WAIT_PHOTO
-    await safe_reply(update, quality_feedback(img, ctx))
-    img = auto_enhance(img)
-    secure_store(ctx, "resize_img", img)
+    fb, _fw, img = await asyncio.to_thread(_preflight, img, ctx, False)
+    await safe_reply(update, fb)
+    await a_secure_store(ctx, "resize_img", img)
+    img = None; gc.collect()
     if ctx.user_data.get("_resize_mode") == "preset":
-        await safe_reply(update, t("select_preset", ctx), preset_kb())
+        await svc_prompt(update, ctx, t("select_preset", ctx), await preset_kb())
         return S.CUSTOM_SELECT_PRESET
-    await safe_reply(update, t("dimensions", ctx))
+    await svc_prompt(update, ctx, t("dimensions", ctx))
     return S.CUSTOM_WAIT_DIMS
 
 def _do_resize(ctx, img: Image.Image, w: int, h: int) -> Image.Image:
+    """Thread-runner. Preset → passport_crop + empty-guard; custom → smart_resize."""
     w, h = clamp_dims(w, h)
     orig_pixels = img.size[0] * img.size[1]
     if ctx.user_data.get("_resize_mode") == "preset":
         try:
-            result = passport_crop(img, w, h)       # 🎯 govt-spec face positioning
+            result = passport_crop(img, w, h)
+            if _content_ratio(result) < 0.10:
+                result = smart_resize(img, w, h, pad_mode=True)
         except Exception:
             result = smart_resize(img, w, h,
                                   pad_mode=bool(ctx.user_data.get("strict", True)))
@@ -1796,36 +1914,37 @@ def _do_resize(ctx, img: Image.Image, w: int, h: int) -> Image.Image:
         result = smart_resize(img, w, h,
                               pad_mode=bool(ctx.user_data.get("strict", True)))
     if (w * h) < orig_pixels:
-        result = post_resize_sharpen(result)        # downscale softness fix
+        result = post_resize_sharpen(result)
     return result
 
 async def custom_select_preset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     if q.data == "preset_custom":
-        await safe_edit(update, t("dimensions", ctx)); return S.CUSTOM_WAIT_DIMS
+        await svc_prompt(update, ctx, t("dimensions", ctx))
+        return S.CUSTOM_WAIT_DIMS
     try:
         pid = int(q.data.replace("preset_", ""))
     except ValueError:
         return S.CUSTOM_SELECT_PRESET
-    preset = db_get_preset_by_id(pid)
+    preset = await asyncio.to_thread(db_get_preset_by_id, pid)
     if not preset:
-        await safe_edit(update, "❌ Preset not found.")
+        await svc_prompt(update, ctx, "❌ Preset not found.")
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     w, h, label = preset["width_px"], preset["height_px"], sanitize_md(preset["label"])
-    img = secure_load(ctx, "resize_img")
+    img = await a_secure_load(ctx, "resize_img")
     if not img:
-        await safe_edit(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
-    result = _do_resize(ctx, img, w, h)
-    del img; gc.collect()
-    preview = create_preview(result)
-    secure_store(ctx, "resize_result", result)
-    del result; gc.collect()
-    await q.message.reply_photo(photo=preview,
-        caption=f"{t('preview', ctx)}\n📋 *{label}*\n📏 `{w}×{h}px`\n🎯 Face auto-positioned (govt spec)",
-        reply_markup=confirm_kb("resize_ok", "resize_retry", ctx), parse_mode="Markdown")
+        return S.SELECT_ACTION
+    result = await asyncio.to_thread(_do_resize, ctx, img, w, h)
+    img = None; gc.collect()
+    preview = await asyncio.to_thread(create_preview, result)
+    await a_secure_store(ctx, "resize_result", result)
+    result = None; gc.collect()
+    await svc_prompt_photo(update, ctx, preview,
+        f"{t('preview', ctx)}\n📋 *{label}*\n📏 `{w}×{h}px`\n🎯 Face auto-positioned (govt spec)",
+        confirm_kb("resize_ok", "resize_retry", ctx))
     return S.CUSTOM_PREVIEW
 
 async def custom_wait_dims(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1833,21 +1952,21 @@ async def custom_wait_dims(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     dpi = ctx.user_data.get("dpi", DPI_DEFAULT)
     dims = parse_dimensions(text, dpi)
     if not dims:
-        await safe_reply(update, t("dimensions", ctx)); return S.CUSTOM_WAIT_DIMS
+        await svc_prompt(update, ctx, t("dimensions", ctx)); return S.CUSTOM_WAIT_DIMS
     w, h = clamp_dims(*dims)
-    img = secure_load(ctx, "resize_img")
+    img = await a_secure_load(ctx, "resize_img")
     if not img:
-        await safe_reply(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
-    result = _do_resize(ctx, img, w, h)
-    del img; gc.collect()
-    preview = create_preview(result)
-    secure_store(ctx, "resize_result", result)
-    del result; gc.collect()
-    await update.message.reply_photo(photo=preview,
-        caption=f"{t('preview', ctx)}\n📏 `{w}×{h}px`",
-        reply_markup=confirm_kb("resize_ok", "resize_retry", ctx), parse_mode="Markdown")
+        return S.SELECT_ACTION
+    result = await asyncio.to_thread(_do_resize, ctx, img, w, h)
+    img = None; gc.collect()
+    preview = await asyncio.to_thread(create_preview, result)
+    await a_secure_store(ctx, "resize_result", result)
+    result = None; gc.collect()
+    await svc_prompt_photo(update, ctx, preview,
+        f"{t('preview', ctx)}\n📏 `{w}×{h}px`",
+        confirm_kb("resize_ok", "resize_retry", ctx))
     return S.CUSTOM_PREVIEW
 
 async def custom_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1858,41 +1977,44 @@ async def custom_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                                          reply_markup=size_option_kb(ctx),
                                          parse_mode="Markdown")
         except BadRequest:
-            await q.message.reply_text(t("size_option", ctx),
-                                       reply_markup=size_option_kb(ctx))
+            await svc_prompt(update, ctx, t("size_option", ctx), size_option_kb(ctx))
         return S.CUSTOM_SIZE_OPT
     elif q.data == "resize_retry":
         secure_wipe_all(ctx, ["resize_result"])
-        try: await q.message.delete()
-        except Exception: pass
-        await ctx.bot.send_message(q.message.chat_id, t("send_photo", ctx))
+        await svc_prompt(update, ctx, t("send_photo", ctx))
         return S.CUSTOM_WAIT_PHOTO
     return S.CUSTOM_PREVIEW
 
 async def custom_size_opt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     if q.data == "sizeopt_kb":
-        await safe_edit(update, t("enter_kb", ctx)); return S.CUSTOM_WAIT_KB
+        await svc_prompt(update, ctx, t("enter_kb", ctx))
+        return S.CUSTOM_WAIT_KB
     elif q.data == "sizeopt_save":
-        await safe_edit(update, t("format_choose", ctx), format_kb()); return S.CUSTOM_WAIT_FORMAT
+        try:
+            await q.edit_message_caption(caption=t("format_choose", ctx),
+                                         reply_markup=format_kb(), parse_mode="Markdown")
+        except BadRequest:
+            await svc_prompt(update, ctx, t("format_choose", ctx), format_kb())
+        return S.CUSTOM_WAIT_FORMAT
     return S.CUSTOM_SIZE_OPT
 
 async def custom_wait_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val = parse_size_kb(update.message.text or "")
     if not val:
-        await safe_reply(update, t("enter_kb", ctx)); return S.CUSTOM_WAIT_KB
+        await svc_prompt(update, ctx, t("enter_kb", ctx)); return S.CUSTOM_WAIT_KB
     ctx.user_data["target_kb"] = val
-    await safe_reply(update, t("format_choose", ctx), format_kb())
+    await svc_prompt(update, ctx, t("format_choose", ctx), format_kb())
     return S.CUSTOM_WAIT_FORMAT
 
 async def custom_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     fmt = q.data.replace("fmt_", "")
-    result = secure_load(ctx, "resize_result")
+    result = await a_secure_load(ctx, "resize_result")
     if not result:
-        await safe_edit(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     dims = result.size
     try:
         target_kb = ctx.user_data.get("target_kb")
@@ -1904,16 +2026,18 @@ async def custom_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             buf = await asyncio.to_thread(save_image, result, fmt,
                                           ctx.user_data.get("dpi", DPI_DEFAULT))
         data = buf.getvalue(); buf.close()
+        result = None; gc.collect()
         await deliver_result(update, ctx, q.message, data,
                              f"output.{fmt.lower()}", dims, "resize_done")
-        del result; gc.collect()
+        data = None; gc.collect()
     except Exception as e:
+        result = None; gc.collect()
         logger.error(f"custom_wait_format: {e}", exc_info=True)
-        await safe_edit(update, t("error", ctx))
+        await safe_reply(update, t("error", ctx))
     finally:
         cleanup_session(ctx)
         await send_main_menu(update, ctx)
-    return ConversationHandler.END
+    return S.SELECT_ACTION
 
 # ─────────────────────────────────────────────────────────────────────
 # REDUCE SIZE FLOW
@@ -1921,54 +2045,58 @@ async def custom_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 async def reduce_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     _known_real_ids.add(uid)
+    if not check_rate_limit(uid):
+        await safe_reply(update, t("rate_limit", ctx)); return S.REDUCE_WAIT_PHOTO
     img = await get_image(update)
     if img == "too_large":
         await safe_reply(update, t("file_too_large", ctx)); return S.REDUCE_WAIT_PHOTO
     if img in ("invalid", None):
         await safe_reply(update, t("invalid_file" if img == "invalid" else "no_photo", ctx))
         return S.REDUCE_WAIT_PHOTO
-    secure_store(ctx, "reduce_img", img)
-    await safe_reply(update, t("enter_kb", ctx))
+    await a_secure_store(ctx, "reduce_img", img)
+    img = None; gc.collect()
+    await svc_prompt(update, ctx, t("enter_kb", ctx))
     return S.REDUCE_WAIT_KB
 
 async def reduce_wait_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val = parse_size_kb(update.message.text or "")
     if not val:
-        await safe_reply(update, t("enter_kb", ctx)); return S.REDUCE_WAIT_KB
+        await svc_prompt(update, ctx, t("enter_kb", ctx)); return S.REDUCE_WAIT_KB
     ctx.user_data["target_kb"] = val
-    await safe_reply(update, t("format_choose", ctx), format_kb())
+    await svc_prompt(update, ctx, t("format_choose", ctx), format_kb())
     return S.REDUCE_WAIT_FORMAT
 
 async def reduce_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     fmt = q.data.replace("fmt_", "")
-    img = secure_load(ctx, "reduce_img")
+    img = await a_secure_load(ctx, "reduce_img")
     if not img:
-        await safe_edit(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
+    dims = img.size                                    # v6.5: pehle capture
     target_kb = ctx.user_data.get("target_kb", 100)
-    proc = await q.message.reply_text(t("processing", ctx))
+    proc = await svc_prompt(update, ctx, t("processing", ctx))
     try:
         buf = await asyncio.wait_for(
             asyncio.to_thread(compress_to_kb, img, target_kb, fmt),
             timeout=PROCESSING_TIMEOUT)
         data = buf.getvalue(); buf.close()
-        await proc.delete()
+        img = None; gc.collect()
         await deliver_result(update, ctx, q.message, data,
-                             f"output.{fmt.lower()}", img.size, "compress_done")
-        del img; gc.collect()
+                             f"output.{fmt.lower()}", dims, "compress_done")
+        data = None; gc.collect()
     except asyncio.TimeoutError:
-        del img; gc.collect()
+        img = None; gc.collect()
         await proc.edit_text(t("timeout_err", ctx))
     except Exception as e:
-        del img; gc.collect()
+        img = None; gc.collect()
         logger.error(f"reduce_wait_format: {e}", exc_info=True)
         await proc.edit_text(t("error", ctx))
     finally:
         cleanup_session(ctx)
         await send_main_menu(update, ctx)
-    return ConversationHandler.END
+    return S.SELECT_ACTION
 
 # ─────────────────────────────────────────────────────────────────────
 # SIGNATURE FLOW
@@ -1976,40 +2104,46 @@ async def reduce_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 async def sig_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     _known_real_ids.add(uid)
+    if not check_rate_limit(uid):
+        await safe_reply(update, t("rate_limit", ctx)); return S.SIG_WAIT_PHOTO
     img = await get_image(update)
     if img == "too_large":
         await safe_reply(update, t("file_too_large", ctx)); return S.SIG_WAIT_PHOTO
     if img in ("invalid", None):
         await safe_reply(update, t("invalid_file" if img == "invalid" else "no_photo", ctx))
         return S.SIG_WAIT_PHOTO
-    arr = np.array(img.convert("RGB"))
-    corners = [arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]]
-    if not all(v > 190 for v in np.mean(corners, axis=0)):
+    if not await asyncio.to_thread(_sig_bg_is_white, img):    # v6.5: thread mein
         await safe_reply(update, t("sig_bg_warn", ctx))
-    proc = await update.message.reply_text(t("processing", ctx))
+    proc = await svc_prompt(update, ctx, t("processing", ctx))
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(extract_signature, img),
             timeout=PROCESSING_TIMEOUT)
-        del img; gc.collect()
-        preview = create_preview(result)           # alpha-safe white bg preview
-        secure_store(ctx, "sig_result", result)
-        del result; gc.collect()
-        await proc.delete()
-        await update.message.reply_photo(photo=preview, caption=t("preview", ctx),
-            reply_markup=confirm_kb("sig_ok", "sig_retry", ctx), parse_mode="Markdown")
+        img = None; gc.collect()
+
+        # v6.5: empty-signature detection (alpha channel mean)
+        alpha_mean = await asyncio.to_thread(
+            lambda r: float(np.asarray(r)[..., 3].mean()), result)
+        if alpha_mean < 3.0:
+            await safe_reply(update, t("sig_empty_warn", ctx))
+
+        preview = await asyncio.to_thread(create_preview, result)
+        await a_secure_store(ctx, "sig_result", result)
+        result = None; gc.collect()
+        await svc_prompt_photo(update, ctx, preview, t("preview", ctx),
+                               confirm_kb("sig_ok", "sig_retry", ctx))
         return S.SIG_PREVIEW
     except asyncio.TimeoutError:
-        del img; gc.collect()
+        img = None; gc.collect()
         await proc.edit_text(t("timeout_err", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     except Exception as e:
-        del img; gc.collect()
+        img = None; gc.collect()
         logger.error(f"sig_wait_photo: {e}", exc_info=True)
         await proc.edit_text(t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
 
 async def sig_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
@@ -2019,95 +2153,93 @@ async def sig_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                                          reply_markup=sig_format_kb(),
                                          parse_mode="Markdown")
         except BadRequest:
-            await q.message.reply_text(t("format_choose", ctx),
-                                       reply_markup=sig_format_kb())
+            await svc_prompt(update, ctx, t("format_choose", ctx), sig_format_kb())
         return S.SIG_WAIT_FORMAT
     elif q.data == "sig_retry":
         secure_wipe_all(ctx, ["sig_result"])
-        try: await q.message.delete()
-        except Exception: pass
-        await ctx.bot.send_message(q.message.chat_id, t("send_photo", ctx))
+        await svc_prompt(update, ctx, t("send_photo", ctx))
         return S.SIG_WAIT_PHOTO
     return S.SIG_PREVIEW
 
 async def sig_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     fmt = q.data.replace("fmt_", "")
-    result = secure_load(ctx, "sig_result")
+    result = await a_secure_load(ctx, "sig_result")
     if not result:
-        await safe_edit(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     dims = result.size
     try:
-        buf = io.BytesIO()
-        if fmt == "PNG":
-            result.save(buf, format="PNG")
-        elif fmt == "JPEG":
-            flatten_on_white(result).save(buf, format="JPEG", quality=MAX_QUALITY,
-                                          dpi=(DPI_DEFAULT, DPI_DEFAULT), optimize=True)
-        else:
-            flatten_on_white(result).save(buf, format="PDF", resolution=DPI_DEFAULT)
-        buf.seek(0)
-        data = buf.getvalue(); buf.close()
+        def _export():
+            b = io.BytesIO()
+            if fmt == "PNG":
+                result.save(b, format="PNG")
+            elif fmt == "JPEG":
+                flatten_on_white(result).save(b, format="JPEG", quality=MAX_QUALITY,
+                                              dpi=(DPI_DEFAULT, DPI_DEFAULT), optimize=True)
+            else:
+                flatten_on_white(result).save(b, format="PDF", resolution=DPI_DEFAULT)
+            return b.getvalue()
+        data = await asyncio.to_thread(_export)
+        result = None; gc.collect()
         await deliver_result(update, ctx, q.message, data,
                              f"signature.{fmt.lower()}", dims, "sig_done")
-        del result; gc.collect()
+        data = None; gc.collect()
     except Exception as e:
+        result = None; gc.collect()
         logger.error(f"sig_wait_format: {e}", exc_info=True)
-        await safe_edit(update, t("error", ctx))
+        await safe_reply(update, t("error", ctx))
     finally:
         cleanup_session(ctx)
         await send_main_menu(update, ctx)
-    return ConversationHandler.END
+    return S.SELECT_ACTION
 
 # ─────────────────────────────────────────────────────────────────────
-# 🎯 EXACT SIZE MATCH FLOW — resolution GUARANTEED same
+# 🎯 EXACT SIZE MATCH FLOW
 # ─────────────────────────────────────────────────────────────────────
 async def size_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     _known_real_ids.add(uid)
     if not check_rate_limit(uid):
-        await safe_reply(update, t("rate_limit", ctx)); return ConversationHandler.END
+        await safe_reply(update, t("rate_limit", ctx)); return S.SIZE_WAIT_PHOTO
     img = await get_image(update)
     if img == "too_large":
         await safe_reply(update, t("file_too_large", ctx)); return S.SIZE_WAIT_PHOTO
     if img in ("invalid", None):
         await safe_reply(update, t("invalid_file" if img == "invalid" else "no_photo", ctx))
         return S.SIZE_WAIT_PHOTO
-    # ⚠️ auto_enhance NAHI — user ki pixels untouched rahni chahiye
-    secure_store(ctx, "size_img", img)
-    await safe_reply(update, t("size_enter_kb", ctx))
+    await a_secure_store(ctx, "size_img", img)   # enhancement NAHI — pixels untouched
+    img = None; gc.collect()
+    await svc_prompt(update, ctx, t("size_enter_kb", ctx))
     return S.SIZE_WAIT_KB
 
 async def size_wait_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val = parse_size_kb(update.message.text or "")
     if not val:
-        await safe_reply(update, t("size_enter_kb", ctx)); return S.SIZE_WAIT_KB
+        await svc_prompt(update, ctx, t("size_enter_kb", ctx)); return S.SIZE_WAIT_KB
     ctx.user_data["target_kb"] = val
-    await safe_reply(update, t("size_fmt_choose", ctx), size_fmt_kb())
+    await svc_prompt(update, ctx, t("size_fmt_choose", ctx), size_fmt_kb())
     return S.SIZE_WAIT_FORMAT
 
 async def size_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     fmt = q.data.replace("fmt_", "")
-    img = secure_load(ctx, "size_img")
+    img = await a_secure_load(ctx, "size_img")
     if not img:
-        await safe_edit(update, t("error", ctx))
+        await svc_prompt(update, ctx, t("error", ctx))
         cleanup_session(ctx); await send_main_menu(update, ctx)
-        return ConversationHandler.END
+        return S.SELECT_ACTION
     target_kb = ctx.user_data.get("target_kb", 100)
     orig_dims = img.size
-    proc = await q.message.reply_text(t("processing", ctx))
+    proc = await svc_prompt(update, ctx, t("processing", ctx))
     try:
         buf, meta = await asyncio.wait_for(
             asyncio.to_thread(match_file_size_kb, img, target_kb, fmt),
             timeout=PROCESSING_TIMEOUT)
         data = buf.getvalue(); buf.close()
-        del img; gc.collect()
+        img = None; gc.collect()
 
-        await proc.delete()
-        # Info caption — transparency = trust
         info = t("size_info", ctx).format(
             w=orig_dims[0], h=orig_dims[1],
             size=format_size(len(data)), target=f"{target_kb}KB",
@@ -2126,17 +2258,18 @@ async def size_wait_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
             document=io.BytesIO(data),
             filename=f"photo_{target_kb}kb.{fmt.lower()}",
             caption=caption, parse_mode="Markdown")
+        data = None; gc.collect()
     except asyncio.TimeoutError:
-        del img; gc.collect()
+        img = None; gc.collect()
         await proc.edit_text(t("timeout_err", ctx))
     except Exception as e:
-        del img; gc.collect()
+        img = None; gc.collect()
         logger.error(f"size_wait_format: {e}", exc_info=True)
         await proc.edit_text(t("error", ctx))
     finally:
         cleanup_session(ctx)
         await send_main_menu(update, ctx)
-    return ConversationHandler.END
+    return S.SELECT_ACTION
 
 # ─────────────────────────────────────────────────────────────────────
 # 🖨 PRINT SHEET FLOW
@@ -2145,33 +2278,24 @@ async def sheet_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     uid = update.effective_user.id
     _known_real_ids.add(uid)
     if not check_rate_limit(uid):
-        await safe_reply(update, t("rate_limit", ctx)); return ConversationHandler.END
+        await safe_reply(update, t("rate_limit", ctx)); return S.SHEET_WAIT_PHOTO
     img = await get_image(update)
     if img == "too_large":
         await safe_reply(update, t("file_too_large", ctx)); return S.SHEET_WAIT_PHOTO
     if img in ("invalid", None):
         await safe_reply(update, t("invalid_file" if img == "invalid" else "no_photo", ctx))
         return S.SHEET_WAIT_PHOTO
-    await safe_reply(update, quality_feedback(img, ctx))
-    img = auto_enhance(img)
-    proc = await update.message.reply_text(t("processing", ctx))
+    fb, _fw, img = await asyncio.to_thread(_preflight, img, ctx, False)
+    await safe_reply(update, fb)
+    proc = await svc_prompt(update, ctx, t("processing", ctx))
     try:
         sheet = await asyncio.wait_for(
             asyncio.to_thread(make_photo_sheet, img),
             timeout=PROCESSING_TIMEOUT)
-        del img; gc.collect()
+        img = None; gc.collect()
+        jpg_data, pdf_data = await asyncio.to_thread(_sheet_encode, sheet)
+        sheet = None; gc.collect()
 
-        # JPEG (print shop) + PDF (direct print)
-        jpg_buf = io.BytesIO()
-        sheet.save(jpg_buf, format="JPEG", quality=MAX_QUALITY,
-                   dpi=(300, 300), optimize=True)
-        jpg_data = jpg_buf.getvalue(); jpg_buf.close()
-        pdf_buf = io.BytesIO()
-        sheet.save(pdf_buf, format="PDF", resolution=300)
-        pdf_data = pdf_buf.getvalue(); pdf_buf.close()
-        del sheet; gc.collect()
-
-        await proc.delete()
         _store_history(ctx, jpg_data, "print_sheet_4x6.jpg")
         await asyncio.to_thread(bump_op_count, update.effective_user.id)
         await update.message.reply_document(
@@ -2180,42 +2304,34 @@ async def sheet_wait_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_document(
             document=io.BytesIO(pdf_data), filename="print_sheet_4x6.pdf",
             caption="📄 PDF version — direct print ke liye")
+        jpg_data = pdf_data = None; gc.collect()
     except asyncio.TimeoutError:
-        del img; gc.collect()
+        img = None; gc.collect()
         await proc.edit_text(t("timeout_err", ctx))
     except Exception as e:
-        del img; gc.collect()
+        img = None; gc.collect()
         logger.error(f"sheet_wait_photo: {e}", exc_info=True)
         await proc.edit_text(t("error", ctx))
     finally:
         cleanup_session(ctx)
         await send_main_menu(update, ctx)
-    return ConversationHandler.END
+    return S.SELECT_ACTION
 
 # ─────────────────────────────────────────────────────────────────────
 # FALLBACKS & ERROR HANDLER
-# ─────────────────────────────────────────────────────────────────────
-async def conversation_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+# ════════════════════════════════════════════════════════════════════
+# v6.4 fix retained: fallback STATE PRESERVE karta hai (return None).
+# Lock/images kabhi orphan nahi hote, user flow kabhi hijack nahi hota.
+# ════════════════════════════════════════════════════════════════════
+async def conversation_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     if update.callback_query:
-        await update.callback_query.answer()
-        await safe_edit(update, t("unexpected", ctx), main_menu_kb(ctx))
-        return S.SELECT_ACTION
-    if update.message:
+        await update.callback_query.answer(t("unexpected", ctx), show_alert=True)
+    elif update.message:
         await safe_reply(update, t("unexpected", ctx))
-        await send_main_menu(update, ctx)
-    return S.SELECT_ACTION
-
-async def fb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await cmd_help(update, ctx)
-    cleanup_session(ctx)
-    await send_main_menu(update, ctx)
-    return ConversationHandler.END
-
-async def fb_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await cmd_history(update, ctx)
-    return S.SELECT_ACTION
+    return None                        # state UNCHANGED — lock/images safe
 
 async def global_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Conversation ke bahar girne wala KUCH BHI — callbacks included."""
     if update.effective_user:
         _known_real_ids.add(update.effective_user.id)
     if update.callback_query:
@@ -2271,11 +2387,6 @@ async def post_shutdown(application: Application):
     _wipe_session_key()
     logger.info("Session key wiped. Goodbye.")
 
-def handle_signal(sig, frame):
-    global _bot_healthy
-    _bot_healthy = False
-    logger.info(f"Signal {sig} — shutting down.")
-
 # ─────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────
@@ -2287,11 +2398,14 @@ def main():
         logger.warning("pillow-heif missing — iPhone HEIC rejected")
     if not MP_OK:
         logger.warning("mediapipe missing — BG change & face-crop degraded")
+    if not WAITRESS_OK:
+        logger.warning("waitress missing — Flask dev server chalega (pip install waitress)")
 
     init_db()
     logger.info(f"Database ready: {DB_PATH}")
     threading.Thread(target=run_flask, daemon=True).start()
-    logger.info(f"Flask health server on port {os.environ.get('PORT', 8080)}")
+    logger.info(f"Health server on port {os.environ.get('PORT', 8080)} "
+                f"({'waitress' if WAITRESS_OK else 'flask-dev'})")
 
     application = (Application.builder()
                    .token(token)
@@ -2299,6 +2413,11 @@ def main():
                    .post_shutdown(post_shutdown)
                    .build())
 
+    # NOTE: /start aur /cancel jaan-boojh ke external list mein NAHI —
+    # conversation ke entry_points/fallbacks se route hote hain.
+    # /help, /history etc. external hain aur NON-DESTRUCTIVE — ye
+    # conversation se PEHLE add hain, isliye mid-flow /help session
+    # ko touch nahi karta (user ka chalu operation preserve hota hai).
     for cmd, fn in [
         ("help",        cmd_help),
         ("privacy",     cmd_privacy),
@@ -2319,7 +2438,12 @@ def main():
     photo_filter = filters.PHOTO | filters.Document.IMAGE
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            # Menu actions ENTRY POINTS — conversation dead ho tab bhi
+            # click → re-enter → turant kaam
+            CallbackQueryHandler(select_action, pattern=MENU_ACTION_PATTERN),
+        ],
         states={
             S.SELECT_ACTION:        [CallbackQueryHandler(select_action)],
             S.BG_WAIT_PHOTO:        [MessageHandler(photo_filter, bg_wait_photo)],
@@ -2355,18 +2479,19 @@ def main():
         fallbacks=[
             CommandHandler("cancel",  cmd_cancel),
             CommandHandler("start",   cmd_start),
-            CommandHandler("help",    fb_help),
-            CommandHandler("history", fb_history),
             MessageHandler(filters.ALL, conversation_fallback),
         ],
         allow_reentry=True,
     )
 
     application.add_handler(conv)
+    # Callback catch-all — conversation ke bahar girne wala har click
+    # answer hota hai (spinner kabhi atka nahi)
+    application.add_handler(CallbackQueryHandler(global_fallback))
     application.add_handler(MessageHandler(filters.ALL, global_fallback))
     application.add_error_handler(error_handler)
 
-    logger.info(f"🚀 {VERSION} starting — production quality mode")
+    logger.info(f"🚀 {VERSION} starting — fully audited production build")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
